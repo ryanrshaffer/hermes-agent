@@ -8,27 +8,34 @@ import { AnsiText } from '@/components/assistant-ui/ansi-text'
 import { useElapsedSeconds } from '@/components/chat/activity-timer'
 import { ActivityTimerText } from '@/components/chat/activity-timer-text'
 import { CompactMarkdown } from '@/components/chat/compact-markdown'
-import { DiffLines } from '@/components/chat/diff-lines'
+import { FileDiffPanel } from '@/components/chat/diff-lines'
 import { DisclosureRow } from '@/components/chat/disclosure-row'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { ZoomableImage } from '@/components/chat/zoomable-image'
-import { BrailleSpinner } from '@/components/ui/braille-spinner'
+import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { CopyButton } from '@/components/ui/copy-button'
 import { FadeText } from '@/components/ui/fade-text'
+import { FileTypeIcon } from '@/components/ui/file-type-icon'
+import { GlyphSpinner } from '@/components/ui/glyph-spinner'
+import { ToolIcon } from '@/components/ui/tool-icon'
+import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { PrettyLink, LinkifiedText as SharedLinkifiedText, urlSlugTitleLabel } from '@/lib/external-link'
 import { AlertCircle, CheckCircle2 } from '@/lib/icons'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { $toolInlineDiffs } from '@/store/tool-diffs'
+import { $toolRowDismissed, dismissToolRow } from '@/store/tool-dismiss'
 import { $toolDisclosureOpen, $toolViewMode, setToolDisclosureOpen } from '@/store/tool-view'
 
 import { PendingToolApproval } from './tool-approval'
 import {
   buildToolView,
   cleanVisibleText,
+  countDiffLineStats,
   inlineDiffFromResult,
+  isFileEditTool,
   isPreviewableTarget,
   looksRedundant,
   type SearchResultRow,
@@ -100,7 +107,7 @@ function rawTechnicalTrace(args: unknown, result: unknown): string {
 function statusGlyph(status: ToolStatus, copy: ToolStatusCopy): ReactNode {
   if (status === 'running') {
     return (
-      <BrailleSpinner
+      <GlyphSpinner
         ariaLabel={copy.statusRunning}
         className="size-3.5 shrink-0 text-[0.95rem] text-(--ui-text-tertiary)"
         spinner="breathe"
@@ -114,10 +121,7 @@ function statusGlyph(status: ToolStatus, copy: ToolStatusCopy): ReactNode {
 
   if (status === 'warning') {
     return (
-      <AlertCircle
-        aria-label={copy.statusRecovered}
-        className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400"
-      />
+      <AlertCircle aria-label={copy.statusRecovered} className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
     )
   }
 
@@ -132,11 +136,23 @@ function statusGlyph(status: ToolStatus, copy: ToolStatusCopy): ReactNode {
 // Leading glyph for any tool-row header. Status (running/error/warning)
 // takes precedence; otherwise falls back to the tool's codicon. Returns
 // null when neither applies so callers can render unconditionally.
-function ToolGlyph({ copy, icon, status }: { copy: ToolStatusCopy; icon?: string; status?: ToolStatus }) {
+function ToolGlyph({
+  copy,
+  filePath,
+  icon,
+  status
+}: {
+  copy: ToolStatusCopy
+  filePath?: string
+  icon?: string
+  status?: ToolStatus
+}) {
   const node = status ? (
     statusGlyph(status, copy)
+  ) : filePath ? (
+    <FileTypeIcon className="text-(--ui-text-tertiary)" path={filePath} size="0.875rem" />
   ) : icon ? (
-    <Codicon className="text-(--ui-text-tertiary)" name={icon} size="0.875rem" />
+    <ToolIcon className="text-(--ui-text-tertiary)" name={icon} size="0.875rem" />
   ) : null
 
   return node ? <span className={TOOL_HEADER_GLYPH_WRAP_CLASS}>{node}</span> : null
@@ -196,22 +212,27 @@ function useDisclosureOpen(disclosureId: string, fallbackOpen = false): boolean 
 function ToolEntry({ part }: ToolEntryProps) {
   const { t } = useI18n()
   const copy = t.assistant.tool
+  const statusCopy = t.statusStack
   const messageId = useAuiState(s => s.message.id)
   const messageRunning = useAuiState(selectMessageRunning)
   const embedded = useContext(ToolEmbedContext)
   const toolViewMode = useStore($toolViewMode)
   const disclosureId = `tool-entry:${messageId}:${toolPartDisclosureId(part)}`
-  const open = useDisclosureOpen(disclosureId)
+  const dismissed = useStore($toolRowDismissed(disclosureId))
   const isPending = messageRunning && part.result === undefined
+  const liveDiffs = useStore($toolInlineDiffs)
+  const sideDiff = part.toolCallId ? liveDiffs[part.toolCallId] || '' : ''
+  const inlineDiff = stripInlineDiffChrome(sideDiff) || inlineDiffFromResult(part.result)
+  const isFileEdit = isFileEditTool(part.toolName)
+  const defaultOpen = Boolean(inlineDiff)
+  const open = useDisclosureOpen(disclosureId, defaultOpen)
+  const canDismiss = !isPending && !embedded
   // Only animate entries that mount while their message is actively
   // streaming — historical sessions mount with `messageRunning === false`,
   // so they paint statically without a settle cascade. The wrapping group
   // handles its own enter animation, so embedded children skip it.
   const enterRef = useEnterAnimation(messageRunning && !embedded, `tool-entry:${disclosureId}`)
   const elapsed = useElapsedSeconds(isPending, `tool:${disclosureId}`)
-  const liveDiffs = useStore($toolInlineDiffs)
-  const sideDiff = part.toolCallId ? liveDiffs[part.toolCallId] || '' : ''
-  const inlineDiff = stripInlineDiffChrome(sideDiff) || inlineDiffFromResult(part.result)
 
   // Stale parts (no result, but message stopped running) get a synthetic
   // empty result so buildToolView treats them as completed-no-output.
@@ -249,11 +270,12 @@ function ToolEntry({ part }: ToolEntryProps) {
   const detailMatchesSubtitle = looksRedundant(view.subtitle, view.detail)
 
   const showDetail =
-    (view.status === 'error' && Boolean(detailSections.summary || detailSections.body)) ||
-    (view.status !== 'error' &&
-      Boolean(view.detail) &&
-      !looksRedundant(view.title, view.detail) &&
-      !detailMatchesSubtitle)
+    !view.inlineDiff &&
+    ((view.status === 'error' && Boolean(detailSections.summary || detailSections.body)) ||
+      (view.status !== 'error' &&
+        Boolean(view.detail) &&
+        !looksRedundant(view.title, view.detail) &&
+        !detailMatchesSubtitle))
 
   const renderDetailAsCode =
     view.status !== 'error' &&
@@ -279,12 +301,60 @@ function ToolEntry({ part }: ToolEntryProps) {
 
   const copyAction = useMemo(() => toolCopyPayload(part, view), [part, view])
 
+  const diffStats = useMemo(
+    () => (isFileEdit && view.inlineDiff ? countDiffLineStats(view.inlineDiff) : null),
+    [isFileEdit, view.inlineDiff]
+  )
+
+  const showDiffStats = !isPending && Boolean(diffStats && (diffStats.added > 0 || diffStats.removed > 0))
+
+  // The header trailing slot only carries the live duration timer while the
+  // tool is running. The copy control used to live here too, but an
+  // `opacity-0` (yet still clickable) button straddling the caret/duration made
+  // the disclosure caret hard to hit. Copy now lives in the expanded body's
+  // top-right, where it can't fight the caret for the right edge.
   const trailing =
-    isPending && !embedded ? (
-      <ActivityTimerText className={TOOL_HEADER_DURATION_CLASS} seconds={elapsed} />
-    ) : !isPending && copyAction.text ? (
-      <CopyButton appearance="tool-row" label={copyAction.label} stopPropagation text={copyAction.text} />
-    ) : undefined
+    isPending && !embedded ? <ActivityTimerText className={TOOL_HEADER_DURATION_CLASS} seconds={elapsed} /> : undefined
+
+  // Once a turn has settled, a hover/focus-revealed dismiss lets the user clear
+  // a completed/failed row that would otherwise sit at the tail of the chat.
+  // It goes in the in-flow `action` slot (not `trailing`) so it can't overlap
+  // the disclosure caret's hit-target — see the comment above `trailing`.
+  const dismissAction = canDismiss ? (
+    <Tip label={statusCopy.dismiss}>
+      <Button
+        aria-label={statusCopy.dismiss}
+        className={cn(
+          'size-5 rounded-md text-(--ui-text-tertiary) transition-opacity hover:text-(--ui-text-primary) hover:opacity-100',
+          open
+            ? 'opacity-80'
+            : 'opacity-0 group-hover/disclosure-row:opacity-80 group-focus-within/disclosure-row:opacity-80'
+        )}
+        onClick={event => {
+          event.stopPropagation()
+          dismissToolRow(disclosureId)
+        }}
+        size="icon-xs"
+        type="button"
+        variant="ghost"
+      >
+        <Codicon name="close" size="0.75rem" />
+      </Button>
+    </Tip>
+  ) : undefined
+
+  if (dismissed) {
+    return null
+  }
+
+  // A completed file edit with no diff to review is a bare, unexpandable row.
+  // This is almost always a `write_file` create after a reload: only `patch`
+  // persists its diff in the tool result, so creates rehydrate diff-less and
+  // read like dead duplicates of the real diff row. Hide them — but keep
+  // in-flight writes (activity) and failures (errors) visible.
+  if (isFileEdit && !isPending && view.status !== 'error' && !view.inlineDiff) {
+    return null
+  }
 
   return (
     <div
@@ -292,17 +362,28 @@ function ToolEntry({ part }: ToolEntryProps) {
         'min-w-0 max-w-full overflow-hidden text-[length:var(--conversation-tool-font-size)] text-(--ui-text-tertiary)',
         open && 'rounded-[0.625rem] border border-(--ui-stroke-tertiary)'
       )}
+      data-file-edit={isFileEdit && open ? '' : undefined}
       data-slot="tool-block"
+      data-tool-row=""
       ref={enterRef}
     >
       <div className={cn(open && 'border-b border-(--ui-stroke-tertiary) px-2 py-1.5')}>
         <DisclosureRow
+          action={dismissAction}
           onToggle={hasExpandableContent ? () => setToolDisclosureOpen(disclosureId, !open) : undefined}
           open={open}
           trailing={trailing}
         >
-          <span className="flex min-w-0 items-center gap-1.5">
-            <ToolGlyph copy={copy} icon={view.icon} status={leadingStatus(isPending, view.status)} />
+          <span
+            className="flex min-w-0 items-center gap-1.5"
+            title={isFileEdit && view.subtitle ? view.subtitle : undefined}
+          >
+            <ToolGlyph
+              copy={copy}
+              filePath={isFileEdit ? view.subtitle : undefined}
+              icon={view.icon}
+              status={leadingStatus(isPending, view.status)}
+            />
             <FadeText
               className={cn(
                 TOOL_HEADER_TITLE_CLASS,
@@ -314,7 +395,17 @@ function ToolEntry({ part }: ToolEntryProps) {
               {view.title}
             </FadeText>
             {!isPending && view.countLabel && <span className={TOOL_HEADER_DURATION_CLASS}>{view.countLabel}</span>}
-            {!isPending && view.durationLabel && (
+            {showDiffStats && diffStats && (
+              <span className="flex shrink-0 items-center gap-1 font-mono text-[0.625rem] tabular-nums">
+                {diffStats.added > 0 && (
+                  <span className="text-emerald-600 dark:text-emerald-400">+{diffStats.added}</span>
+                )}
+                {diffStats.removed > 0 && (
+                  <span className="text-rose-600 dark:text-rose-400">−{diffStats.removed}</span>
+                )}
+              </span>
+            )}
+            {!isFileEdit && !isPending && view.durationLabel && (
               <span className={TOOL_HEADER_DURATION_CLASS}>{view.durationLabel}</span>
             )}
           </span>
@@ -322,7 +413,18 @@ function ToolEntry({ part }: ToolEntryProps) {
       </div>
       {isPending && <PendingToolApproval part={part} />}
       {open && (
-        <div className="grid w-full min-w-0 max-w-full gap-1.5 overflow-hidden p-1.5">
+        <div className="relative grid w-full min-w-0 max-w-full gap-1.5 overflow-hidden p-1.5">
+          {copyAction.text && (
+            <CopyButton
+              appearance="inline"
+              className="absolute right-1.5 top-1.5 z-10 h-5 gap-0 rounded-md border border-(--ui-stroke-tertiary) bg-background/80 px-1 opacity-100 backdrop-blur-sm transition-opacity hover:opacity-100 focus-visible:opacity-100"
+              iconClassName="size-3"
+              label={copyAction.label}
+              showLabel={false}
+              stopPropagation
+              text={copyAction.text}
+            />
+          )}
           {!embedded && view.previewTarget && isPreviewableTarget(view.previewTarget) && (
             <PreviewAttachment source="tool-result" target={view.previewTarget} />
           )}
@@ -337,6 +439,7 @@ function ToolEntry({ part }: ToolEntryProps) {
               <SearchResultsList hits={view.searchHits} />
             </div>
           )}
+          {view.inlineDiff && <FileDiffPanel diff={view.inlineDiff} path={isFileEdit ? view.subtitle : undefined} />}
           {showDetail &&
             toolViewMode !== 'technical' &&
             (view.status === 'error' ? (
@@ -405,14 +508,21 @@ function ToolEntry({ part }: ToolEntryProps) {
               </pre>
             </details>
           )}
-          {toolViewMode === 'technical' && (
+          {toolViewMode === 'technical' && !(isFileEdit && view.inlineDiff) && (
             <pre className={cn(TOOL_SECTION_PRE_CLASS, 'whitespace-pre-wrap wrap-anywhere')}>
               {rawTechnicalTrace(part.args, part.result)}
             </pre>
           )}
+          {toolViewMode === 'technical' && isFileEdit && view.inlineDiff && (
+            <details className="max-w-full">
+              <summary className={cn(TOOL_SECTION_LABEL_CLASS, 'mb-0 cursor-pointer')}>Tool payload</summary>
+              <pre className={cn(TOOL_SECTION_PRE_CLASS, 'mt-1 whitespace-pre-wrap wrap-anywhere')}>
+                {rawTechnicalTrace(part.args, part.result)}
+              </pre>
+            </details>
+          )}
         </div>
       )}
-      {open && view.inlineDiff && <DiffLines text={view.inlineDiff} />}
     </div>
   )
 }
@@ -445,6 +555,7 @@ export const ToolGroupSlot: FC<PropsWithChildren<{ endIndex: number; startIndex:
       <div
         className="grid min-w-0 max-w-full gap-(--tool-row-gap) overflow-hidden"
         data-slot="tool-block"
+        data-tool-group=""
         ref={enterRef}
       >
         {children}

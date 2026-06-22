@@ -72,6 +72,46 @@ export interface MessageRunningStateSlice {
   }
 }
 
+const FILE_EDIT_TOOL_NAMES = new Set(['edit_file', 'patch', 'write_file'])
+
+export function isFileEditTool(toolName: string): boolean {
+  return FILE_EDIT_TOOL_NAMES.has(toolName)
+}
+
+export interface DiffLineStats {
+  added: number
+  removed: number
+}
+
+export function countDiffLineStats(diff: string): DiffLineStats {
+  let added = 0
+  let removed = 0
+
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('+') && !line.startsWith('+++')) {
+      added += 1
+    } else if (line.startsWith('-') && !line.startsWith('---')) {
+      removed += 1
+    }
+  }
+
+  return { added, removed }
+}
+
+function fileEditPath(args: Record<string, unknown>, result: Record<string, unknown>): string {
+  return (
+    firstStringField(args, ['path', 'file', 'filepath']) ||
+    firstStringField(result, ['path', 'file', 'filepath', 'resolved_path']) ||
+    htmlPathFromInlineDiff(firstStringField(result, ['inline_diff', 'diff']))
+  )
+}
+
+function fileEditBasename(path: string): string {
+  const normalized = path.replace(/\\/g, '/').trim()
+
+  return normalized.split('/').filter(Boolean).pop() || normalized
+}
+
 const TOOL_META: Record<string, ToolMeta> = {
   browser_click: { done: 'Clicked page element', pending: 'Clicking page element', icon: 'globe', tone: 'browser' },
   browser_fill: { done: 'Filled form field', pending: 'Filling form field', icon: 'globe', tone: 'browser' },
@@ -90,11 +130,12 @@ const TOOL_META: Record<string, ToolMeta> = {
   },
   browser_type: { done: 'Typed on page', pending: 'Typing on page', icon: 'globe', tone: 'browser' },
   clarify: { done: 'Asked a question', pending: 'Asking a question', icon: 'question', tone: 'agent' },
+  cronjob: { done: 'Cron job', pending: 'Scheduling cron job', icon: 'watch', tone: 'agent' },
   edit_file: { done: 'Edited file', pending: 'Editing file', icon: 'edit', tone: 'file' },
   execute_code: { done: 'Ran code', pending: 'Running code', icon: 'terminal', tone: 'terminal' },
   image_generate: { done: 'Generated image', pending: 'Generating image', icon: 'file-media', tone: 'image' },
   list_files: { done: 'Listed files', pending: 'Listing files', icon: 'files', tone: 'file' },
-  patch: { done: 'Patched file', pending: 'Patching file', icon: 'diff', tone: 'file' },
+  patch: { done: 'Patched file', pending: 'Patching file', icon: 'edit', tone: 'file' },
   read_file: { done: 'Read file', pending: 'Reading file', icon: 'file', tone: 'file' },
   search_files: { done: 'Searched files', pending: 'Searching files', icon: 'search', tone: 'file' },
   session_search_recall: {
@@ -796,8 +837,8 @@ function toolPreviewTarget(toolName: string, args: Record<string, unknown>, resu
     return looksLikeUrl(explicit) ? explicit : findFirstUrl(args, result)
   }
 
-  if (toolName === 'write_file' || toolName === 'edit_file') {
-    return htmlPathFromInlineDiff(firstStringField(result, ['inline_diff']))
+  if (isFileEditTool(toolName)) {
+    return htmlPathFromInlineDiff(firstStringField(result, ['inline_diff', 'diff']))
   }
 
   return ''
@@ -857,9 +898,17 @@ function stripDividerLines(value: string): string {
 }
 
 export function inlineDiffFromResult(result: unknown): string {
-  const value = parseMaybeObject(result).inline_diff
+  const record = parseMaybeObject(result)
 
-  return typeof value === 'string' ? stripInlineDiffChrome(value) : ''
+  for (const key of ['inline_diff', 'diff']) {
+    const value = record[key]
+
+    if (typeof value === 'string' && value.trim()) {
+      return stripInlineDiffChrome(value)
+    }
+  }
+
+  return ''
 }
 
 // Falls back to a string only when there's something concrete to render —
@@ -897,6 +946,80 @@ function fallbackDetailText(args: unknown, result: unknown): string {
   }
 
   return formatToolResultSummary(args) || minimalValueSummary(args)
+}
+
+function cronScalar(value: unknown): string {
+  if (typeof value === 'string') return value.trim()
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+
+  return ''
+}
+
+function formatCronTime(iso: string): string {
+  const ts = Date.parse(iso)
+
+  if (Number.isNaN(ts)) return iso
+
+  return new Date(ts).toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  })
+}
+
+function cronjobSubtitle(
+  argsRecord: Record<string, unknown>,
+  resultRecord: Record<string, unknown>
+): string {
+  const jobs = Array.isArray(resultRecord.jobs) ? resultRecord.jobs : null
+
+  if (jobs) {
+    return jobs.length ? `${jobs.length} cron job${jobs.length === 1 ? '' : 's'}` : 'No cron jobs'
+  }
+
+  const message = firstStringField(resultRecord, ['message'])
+
+  if (message) return message
+
+  const action = firstStringField(argsRecord, ['action']) || 'manage'
+  const name = firstStringField(resultRecord, ['name']) || firstStringField(argsRecord, ['name', 'job_id'])
+  const label = `${action[0]?.toUpperCase() ?? ''}${action.slice(1)}`
+
+  return name ? `${label} ${name}` : `Cron ${action}`
+}
+
+function cronjobDetail(
+  argsRecord: Record<string, unknown>,
+  resultRecord: Record<string, unknown>
+): string {
+  const jobs = Array.isArray(resultRecord.jobs) ? resultRecord.jobs : null
+
+  if (jobs) {
+    if (!jobs.length) return 'No cron jobs scheduled'
+
+    return jobs
+      .slice(0, 20)
+      .map(job => {
+        const row = isRecord(job) ? job : {}
+        const name = firstStringField(row, ['name', 'id']) || 'job'
+        const sched = firstStringField(row, ['schedule_display', 'schedule'])
+
+        return sched ? `- ${name} · ${sched}` : `- ${name}`
+      })
+      .join('\n')
+  }
+
+  const nextRun = cronScalar(resultRecord.next_run_at)
+  const rows: [string, string][] = [
+    ['Schedule', cronScalar(resultRecord.schedule)],
+    ['Repeat', cronScalar(resultRecord.repeat)],
+    ['Delivery', cronScalar(resultRecord.deliver)],
+    ['Next run', nextRun ? formatCronTime(nextRun) : '']
+  ]
+  const lines = rows.filter(([, value]) => value).map(([key, value]) => `${key}: ${value}`)
+
+  return lines.length ? lines.join('\n') : fallbackDetailText(argsRecord, resultRecord)
 }
 
 function toolSubtitle(
@@ -972,15 +1095,22 @@ function toolSubtitle(
     return command ? compactPreview(command, 120) : 'Executed command'
   }
 
-  if (toolName === 'read_file' || toolName === 'write_file' || toolName === 'edit_file') {
-    const path =
-      firstStringField(argsRecord, ['path', 'file', 'filepath']) ||
-      htmlPathFromInlineDiff(firstStringField(resultRecord, ['inline_diff']))
+  if (toolName === 'read_file' || isFileEditTool(toolName)) {
+    const isEdit = isFileEditTool(toolName)
 
-    return (
-      path ||
-      (firstStringField(resultRecord, ['inline_diff']) ? 'Changed file' : fallbackDetailText(argsRecord, resultRecord))
-    )
+    const path = isEdit
+      ? fileEditPath(argsRecord, resultRecord)
+      : firstStringField(argsRecord, ['path', 'file', 'filepath'])
+
+    if (path) {
+      return path
+    }
+
+    if (!isEdit) {
+      return fallbackDetailText(argsRecord, resultRecord)
+    }
+
+    return inlineDiffFromResult(resultRecord) ? 'Changed file' : ''
   }
 
   if (toolName === 'web_extract') {
@@ -990,6 +1120,10 @@ function toolSubtitle(
       findFirstUrl(argsRecord, resultRecord)
 
     return url ? hostnameOf(url) : 'Fetched webpage'
+  }
+
+  if (toolName === 'cronjob') {
+    return cronjobSubtitle(argsRecord, resultRecord)
   }
 
   return (
@@ -1074,8 +1208,22 @@ function toolDetailText(
     }
   }
 
-  if (part.toolName === 'write_file' || part.toolName === 'edit_file') {
-    return inlineDiffFromResult(part.result) ? '' : fallbackDetailText(argsRecord, resultRecord)
+  if (isFileEditTool(part.toolName)) {
+    if (inlineDiffFromResult(part.result)) {
+      return ''
+    }
+
+    const summary = firstStringField(resultRecord, ['message', 'summary'])
+
+    if (summary) {
+      return summary
+    }
+
+    if (fileEditPath(argsRecord, resultRecord)) {
+      return ''
+    }
+
+    return fallbackDetailText(argsRecord, resultRecord)
   }
 
   if (part.toolName === 'web_search') {
@@ -1090,6 +1238,10 @@ function toolDetailText(
     return detail
       .replace(/^\s*-\s*Duration\s+S\s*:\s*[-+]?[\d.]+(?:e[-+]?\d+)?\s*$/gim, `- Duration: ${duration}`)
       .replace(/\bDuration\s+S\s*:/gi, 'Duration:')
+  }
+
+  if (part.toolName === 'cronjob') {
+    return cronjobDetail(argsRecord, resultRecord)
   }
 
   return fallbackDetailText(argsRecord, resultRecord)
@@ -1170,8 +1322,12 @@ export function toolCopyPayload(part: ToolPart, view: ToolView): { label: string
     }
   }
 
-  if (part.toolName === 'write_file' || part.toolName === 'edit_file') {
-    const path = firstStringField(args, ['path', 'file', 'filepath'])
+  if (isFileEditTool(part.toolName)) {
+    if (view.inlineDiff.trim()) {
+      return { label: copy.file, text: view.inlineDiff }
+    }
+
+    const path = fileEditPath(args, result)
 
     if (path) {
       return { label: copy.path, text: path }
@@ -1221,6 +1377,14 @@ function dynamicTitle(
     }
   }
 
+  if (isFileEditTool(part.toolName)) {
+    const path = fileEditPath(args, result)
+
+    if (path) {
+      return fileEditBasename(path)
+    }
+  }
+
   return fallback
 }
 
@@ -1234,7 +1398,12 @@ export function buildToolView(part: ToolPart, inlineDiff: string): ToolView {
   const title = dynamicTitle(part, argsRecord, resultRecord, baseTitle)
   const titleEnriched = title !== baseTitle
   const baseSubtitle = error || toolSubtitle(part, argsRecord, resultRecord)
-  const keepSubtitleWithTitle = part.toolName === 'terminal' || part.toolName === 'execute_code'
+
+  const keepSubtitleWithTitle =
+    part.toolName === 'terminal' ||
+    part.toolName === 'execute_code' ||
+    (isFileEditTool(part.toolName) && Boolean(baseSubtitle.trim()))
+
   const subtitle = titleEnriched && !error && !keepSubtitleWithTitle ? '' : baseSubtitle
   const detailBody = stripDividerLines(toolDetailText(part, argsRecord, resultRecord))
 
