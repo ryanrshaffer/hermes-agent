@@ -223,7 +223,19 @@ def test_resolve_provider_explicit_codex_does_not_fallback(monkeypatch):
 def test_save_codex_tokens_roundtrip(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
-    (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {"access_token": "old-at", "refresh_token": "old-rt"},
+                "last_auth_error": {
+                    "provider": "openai-codex",
+                    "code": "refresh_token_reused",
+                    "reason": "credential_pool_refresh_failure",
+                },
+            },
+        },
+    }))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     _save_codex_tokens({"access_token": "at123", "refresh_token": "rt456"})
@@ -231,6 +243,8 @@ def test_save_codex_tokens_roundtrip(tmp_path, monkeypatch):
 
     assert data["tokens"]["access_token"] == "at123"
     assert data["tokens"]["refresh_token"] == "rt456"
+    auth = json.loads((hermes_home / "auth.json").read_text())
+    assert "last_auth_error" not in auth["providers"]["openai-codex"]
 
 
 def test_save_codex_tokens_syncs_credential_pool(tmp_path, monkeypatch):

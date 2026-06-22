@@ -168,10 +168,25 @@ def show_status(args):
         display = redact_key(value) if not show_all else value
         print(f"  {name:<12}  {check_mark(has_key)} {display}")
 
-    from hermes_cli.auth import get_anthropic_key
-    anthropic_value = get_anthropic_key()
-    anthropic_display = redact_key(anthropic_value) if not show_all else anthropic_value
-    print(f"  {'Anthropic':<12}  {check_mark(bool(anthropic_value))} {anthropic_display}")
+    try:
+        from hermes_cli.auth import get_anthropic_auth_status, get_anthropic_key
+
+        anthropic_value = get_anthropic_key()
+        anthropic_status = get_anthropic_auth_status() or {}
+    except Exception:
+        anthropic_value = ""
+        anthropic_status = {}
+
+    anthropic_logged_in = bool(anthropic_value or anthropic_status.get("logged_in"))
+    if anthropic_value:
+        anthropic_display = redact_key(anthropic_value) if not show_all else anthropic_value
+    elif anthropic_logged_in and anthropic_status.get("key_source") == "claude_code_oauth":
+        anthropic_display = "Claude Code OAuth"
+    elif anthropic_logged_in:
+        anthropic_display = anthropic_status.get("key_source") or "configured"
+    else:
+        anthropic_display = color("(not set)", Colors.DIM)
+    print(f"  {'Anthropic':<12}  {check_mark(anthropic_logged_in)} {anthropic_display}")
 
     # =========================================================================
     # Auth Providers (OAuth)
@@ -291,6 +306,15 @@ def show_status(args):
         print(f"    Access exp: {minimax_exp}")
     if minimax_status.get("error") and not minimax_logged_in:
         print(f"    Error:      {minimax_status.get('error')}")
+
+    if anthropic_status.get("key_source") == "claude_code_oauth" or anthropic_status.get("error"):
+        anthropic_oauth_logged_in = bool(anthropic_status.get("logged_in"))
+        print(
+            f"  {'Anthropic OAuth':<12}  {check_mark(anthropic_oauth_logged_in)} "
+            f"{'logged in via Claude Code' if anthropic_oauth_logged_in else 'not logged in'}"
+        )
+        if anthropic_status.get("error") and not anthropic_oauth_logged_in:
+            print(f"    Error:      {anthropic_status.get('error')}")
 
     # xAI OAuth — separate try/except so an import failure here cannot
     # disrupt the already-printed Nous/Codex/Qwen/MiniMax rows above.

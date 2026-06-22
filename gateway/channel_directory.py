@@ -244,15 +244,37 @@ def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
 # Read / resolve
 # ---------------------------------------------------------------------------
 
+def _candidate_directory_paths() -> List[Any]:
+    """Return channel-directory cache paths to try, profile-local first.
+
+    Worker profiles run with ``HERMES_HOME=<root>/profiles/<name>`` while the
+    gateway writes the live channel directory in the root/default Hermes home.
+    Without this fallback, profile-scoped workers see an empty target list and
+    block outbound delivery cards even though the default gateway is connected.
+    """
+    paths = [DIRECTORY_PATH]
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root_path = get_default_hermes_root() / "channel_directory.json"
+        if root_path not in paths:
+            paths.append(root_path)
+    except Exception:
+        pass
+    return paths
+
+
 def load_directory() -> Dict[str, Any]:
     """Load the cached channel directory from disk."""
-    if not DIRECTORY_PATH.exists():
-        return {"updated_at": None, "platforms": {}}
-    try:
-        with open(DIRECTORY_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"updated_at": None, "platforms": {}}
+    for path in _candidate_directory_paths():
+        if not path.exists():
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            continue
+    return {"updated_at": None, "platforms": {}}
 
 
 def lookup_channel_type(platform_name: str, chat_id: str) -> Optional[str]:

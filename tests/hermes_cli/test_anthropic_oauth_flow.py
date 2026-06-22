@@ -3,6 +3,22 @@
 from hermes_cli.config import load_env, save_env_value
 
 
+def test_anthropic_status_reports_claude_code_oauth(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.resolve_anthropic_token",
+        lambda: "cc-access-token",
+    )
+
+    from hermes_cli.auth import get_auth_status
+
+    status = get_auth_status("anthropic")
+
+    assert status["logged_in"] is True
+    assert status["configured"] is True
+    assert status["key_source"] == "claude_code_oauth"
+
+
 def test_run_anthropic_oauth_flow_prefers_claude_code_credentials(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(

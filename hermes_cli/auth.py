@@ -3419,6 +3419,7 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
         state["auth_mode"] = "chatgpt"
         if label and str(label).strip():
             state["label"] = str(label).strip()
+        state.pop("last_auth_error", None)
         _save_provider_state(auth_store, "openai-codex", state)
         _sync_codex_pool_entries(auth_store, tokens, last_refresh)
         _save_auth_store(auth_store)
@@ -5709,6 +5710,35 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def get_anthropic_auth_status() -> Dict[str, Any]:
+    """Status snapshot for Anthropic, including Claude Code OAuth credentials."""
+    status = get_api_key_provider_status("anthropic")
+    if status.get("logged_in"):
+        return status
+
+    try:
+        from agent.anthropic_adapter import resolve_anthropic_token
+
+        if resolve_anthropic_token():
+            return {
+                **status,
+                "configured": True,
+                "provider": "anthropic",
+                "name": PROVIDER_REGISTRY["anthropic"].name,
+                "key_source": "claude_code_oauth",
+                "base_url": PROVIDER_REGISTRY["anthropic"].inference_base_url,
+                "logged_in": True,
+            }
+    except Exception as exc:
+        return {
+            **status,
+            "provider": "anthropic",
+            "error": str(exc),
+        }
+
+    return status
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
@@ -5762,6 +5792,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
+    if target == "anthropic":
+        return get_anthropic_auth_status()
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
     if pconfig and pconfig.auth_type == "api_key":

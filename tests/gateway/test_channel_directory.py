@@ -47,6 +47,22 @@ class TestLoadDirectory:
             result = load_directory()
         assert result["updated_at"] is None
 
+    def test_profile_home_falls_back_to_root_directory(self, tmp_path):
+        root = tmp_path / "hermes-root"
+        profile_home = root / "profiles" / "inbox-agent"
+        profile_home.mkdir(parents=True)
+        root_cache = _write_directory(root, {
+            "telegram": [{"id": "123", "name": "Ryan", "type": "dm"}]
+        })
+        missing_profile_cache = profile_home / "channel_directory.json"
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", missing_profile_cache), \
+             patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}):
+            result = load_directory()
+
+        assert root_cache.exists()
+        assert result["platforms"]["telegram"][0]["name"] == "Ryan"
+
 
 class TestBuildChannelDirectoryWrites:
     def test_failed_write_preserves_previous_cache(self, tmp_path, monkeypatch):

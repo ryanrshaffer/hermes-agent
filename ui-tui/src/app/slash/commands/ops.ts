@@ -1,3 +1,7 @@
+import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
+
 import type {
   BrowserManageResponse,
   CommandsCatalogResponse,
@@ -18,6 +22,39 @@ import { applyDelegationStatus, getDelegationState } from '../../delegationStore
 import { patchOverlayState } from '../../overlayStore.js'
 import { getSpawnHistory, pushDiskSnapshot, setDiffPair, type SpawnSnapshot } from '../../spawnHistoryStore.js'
 import type { SlashCommand } from '../types.js'
+
+// ── Hermes browser-CDP on-demand launcher ─────────────────────────
+// The Hermes_Browser_CDP Windows scheduled task no longer runs on a
+// timer; it fires on demand. When `/browser connect` targets the
+// local Hermes CDP endpoint we trigger that task first via
+// %HERMES_HOME%\browser-cdp\Ensure-HermesBrowserCdp.ps1, which is a
+// fast no-op when the endpoint is already up.
+
+const HERMES_CDP_URL = 'http://127.0.0.1:9223'
+
+const HERMES_CDP_ENSURE_SCRIPT: null | string = (() => {
+  if (process.platform !== 'win32') return null
+  const home = process.env.HERMES_HOME
+  if (!home) return null
+  const candidate = join(home, 'browser-cdp', 'Ensure-HermesBrowserCdp.ps1')
+  return existsSync(candidate) ? candidate : null
+})()
+
+const isHermesCdpUrl = (url: string): boolean =>
+  /^https?:\/\/(127\.0\.0\.1|localhost):9223(\/|$)/i.test(url)
+
+const ensureHermesCdp = (): Promise<void> =>
+  new Promise(resolve => {
+    if (!HERMES_CDP_ENSURE_SCRIPT) return resolve()
+    const ps = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', HERMES_CDP_ENSURE_SCRIPT, '-Quiet'],
+      { windowsHide: true }
+    )
+    const done = (): void => resolve()
+    ps.on('error', done)
+    ps.on('close', done)
+  })
 
 interface SkillInfo {
   category?: string
@@ -152,42 +189,55 @@ export const opsCommands: SlashCommand[] = [
       }
 
       const sid = ctx.sid ?? null
-      const url = action === 'connect' ? rest.join(' ').trim() || 'http://127.0.0.1:9222' : undefined
+      const url = action === 'connect' ? rest.join(' ').trim() || HERMES_CDP_URL : undefined
 
       if (url) {
         ctx.transcript.sys(`checking Chromium-family browser remote debugging at ${url}...`)
       }
 
-      ctx.gateway
-        .rpc<BrowserManageResponse>('browser.manage', { action, session_id: sid, ...(url && { url }) })
-        .then(
-          ctx.guarded<BrowserManageResponse>(r => {
-            // Without a session we can't subscribe to streamed
-            // browser.progress events, so flush the bundled list.
-            if (!sid) {
-              r.messages?.forEach(message => ctx.transcript.sys(message))
-            }
+      const doManage = (): void => {
+        ctx.gateway
+          .rpc<BrowserManageResponse>('browser.manage', { action, session_id: sid, ...(url && { url }) })
+          .then(
+            ctx.guarded<BrowserManageResponse>(r => {
+              // Without a session we can't subscribe to streamed
+              // browser.progress events, so flush the bundled list.
+              if (!sid) {
+                r.messages?.forEach(message => ctx.transcript.sys(message))
+              }
 
-            if (action === 'status') {
-              return ctx.transcript.sys(
-                r.connected
-                  ? `browser connected: ${r.url || '(url unavailable)'}`
-                  : 'browser not connected (try /browser connect <url> or set browser.cdp_url in config.yaml)'
-              )
-            }
+              if (action === 'status') {
+                return ctx.transcript.sys(
+                  r.connected
+                    ? `browser connected: ${r.url || '(url unavailable)'}`
+                    : 'browser not connected (try /browser connect <url> or set browser.cdp_url in config.yaml)'
+                )
+              }
 
-            if (action === 'disconnect') {
-              return ctx.transcript.sys('browser disconnected')
-            }
+              if (action === 'disconnect') {
+                return ctx.transcript.sys('browser disconnected')
+              }
 
-            if (r.connected) {
-              ctx.transcript.sys('Browser connected to live Chromium-family browser via CDP')
-              ctx.transcript.sys(`Endpoint: ${r.url || '(url unavailable)'}`)
-              ctx.transcript.sys('next browser tool call will use this CDP endpoint')
-            }
-          })
-        )
-        .catch(ctx.guardedErr)
+              if (r.connected) {
+                ctx.transcript.sys('Browser connected to live Chromium-family browser via CDP')
+                ctx.transcript.sys(`Endpoint: ${r.url || '(url unavailable)'}`)
+                ctx.transcript.sys('next browser tool call will use this CDP endpoint')
+              }
+            })
+          )
+          .catch(ctx.guardedErr)
+      }
+
+      // If connecting to the on-demand Hermes CDP endpoint, fire its
+      // scheduled task first so the listener is up by the time
+      // browser.manage probes /json/version. Fast no-op if already up.
+      if (action === 'connect' && url && isHermesCdpUrl(url) && HERMES_CDP_ENSURE_SCRIPT) {
+        ctx.transcript.sys('triggering Hermes_Browser_CDP on-demand task...')
+        ensureHermesCdp().then(doManage, doManage)
+        return
+      }
+
+      doManage()
     }
   },
 
