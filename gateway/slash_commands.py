@@ -392,6 +392,30 @@ class GatewaySlashCommandsMixin:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
 
+    async def _handle_delegate_command(self, event: MessageEvent) -> str:
+        """Handle /delegate by translating it into a Kanban create command."""
+        from hermes_cli.team_commands import delegate_to_kanban_args
+
+        try:
+            kanban_args = delegate_to_kanban_args(event.text or "")
+        except ValueError as exc:
+            return str(exc)
+
+        # Reuse the /kanban path so create notifications auto-subscribe the
+        # originating chat/thread exactly like a direct /kanban create.
+        event.text = f"/kanban {kanban_args}"
+        return await self._handle_kanban_command(event)
+
+    async def _handle_team_command(self, event: MessageEvent) -> str:
+        """Handle /team read-only Kanban/team status helpers."""
+        import asyncio
+        from hermes_cli.team_commands import run_team_command
+
+        try:
+            return await asyncio.to_thread(run_team_command, event.text or "")
+        except ValueError as exc:
+            return str(exc)
+
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
         from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model

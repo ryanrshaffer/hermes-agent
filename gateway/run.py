@@ -7760,13 +7760,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "background":
                 return await self._handle_background_command(event)
 
-            # /kanban must bypass the guard. It writes to a profile-agnostic
-            # DB (kanban.db), not to the running agent's state. In fact
-            # /kanban unblock is often the only way to free a worker that
-            # has blocked waiting for a peer — letting that be dispatched
-            # mid-run is the whole point of the board.
-            if _cmd_def_inner and _cmd_def_inner.name == "kanban":
-                return await self._handle_kanban_command(event)
+            # /kanban and its /delegate + /team convenience wrappers must
+            # bypass the guard. They operate on the profile-agnostic Kanban
+            # DB, not the running agent's message state.
+            if _cmd_def_inner and _cmd_def_inner.name in {"kanban", "delegate", "team"}:
+                if _cmd_def_inner.name == "kanban":
+                    return await self._handle_kanban_command(event)
+                if _cmd_def_inner.name == "delegate":
+                    return await self._handle_delegate_command(event)
+                return await self._handle_team_command(event)
 
             # /goal is safe mid-run for status/pause/clear/wait (inspection
             # and control-plane only — doesn't interrupt the running turn).
@@ -8130,6 +8132,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "kanban":
             return await self._handle_kanban_command(event)
+
+        if canonical == "delegate":
+            return await self._handle_delegate_command(event)
+
+        if canonical == "team":
+            return await self._handle_team_command(event)
 
         if canonical == "suggestions":
             return await self._handle_suggestions_command(event)

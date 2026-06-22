@@ -1333,6 +1333,28 @@ class CLICommandsMixin:
         if output:
             print(output)
 
+    def _handle_delegate_command(self, cmd: str):
+        """Handle /delegate by translating it into a Kanban create command."""
+        from hermes_cli.team_commands import delegate_to_kanban_args
+
+        try:
+            kanban_args = delegate_to_kanban_args(cmd)
+        except ValueError as exc:
+            print(str(exc))
+            return
+        self._handle_kanban_command(f"/kanban {kanban_args}")
+
+    def _handle_team_command(self, cmd: str):
+        """Handle /team read-only Kanban/team status helpers."""
+        from hermes_cli.team_commands import run_team_command
+
+        try:
+            output = run_team_command(cmd)
+        except ValueError as exc:
+            output = str(exc)
+        if output:
+            print(output)
+
     def _handle_skills_command(self, cmd: str):
         """Handle /skills slash command — delegates to hermes_cli.skills_hub."""
         from cli import ChatConsole
