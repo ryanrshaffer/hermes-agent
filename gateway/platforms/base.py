@@ -1066,12 +1066,48 @@ def _media_delivery_denied_paths() -> List[Path]:
         denied.append(home / sub)
     # The active Hermes profile and shared Hermes root both contain control
     # files and credentials. Only cache subdirectories under them are
-    # explicitly allowlisted above.
+    # explicitly allowlisted above (matched BEFORE this denylist in
+    # validate_media_delivery_path, so generated media still delivers).
+    #
+    # These are the per-file credential / secret stores that live at the
+    # HERMES_HOME root. The set mirrors the canonical read guard in
+    # agent/file_safety.py (get_read_block_error / build_write_denied_*) so the
+    # delivery (read/exfil) side can't trail the write side: a credential the
+    # agent is forbidden to write or read must also never be auto-attached to a
+    # chat reply. Enumerated explicitly per-file rather than denying the whole
+    # tree, so skills/, logs/, and ad-hoc agent-written files under ~/.hermes
+    # stay deliverable (see #32090, #34425).
+    _ROOT_CREDENTIAL_FILES = (
+        ".env",
+        "auth.json",
+        "auth.lock",
+        "credentials",
+        "config.yaml",
+        # Anthropic PKCE / OAuth refresh credential store.
+        ".anthropic_oauth.json",
+        # Google Workspace skill: auto-refreshing OAuth token (mtime bumps
+        # every turn, which defeated the strict-mode recency window) plus the
+        # pending-exchange session/verifier file.
+        "google_token.json",
+        "google_oauth_pending.json",
+        os.path.join("auth", "google_oauth.json"),
+        # Webhook subscription HMAC secrets.
+        "webhook_subscriptions.json",
+        # Bitwarden Secrets Manager plaintext disk cache.
+        os.path.join("cache", "bws_cache.json"),
+    )
+    # Directory trees whose every child is credential material. (MCP OAuth
+    # tokens under mcp-tokens/ are handled by the sibling targeted PR #37222;
+    # session/kanban SQLite stores by #41071 — kept out of this diff to avoid
+    # overlap.)
+    _ROOT_CREDENTIAL_DIRS = (
+        "pairing",
+    )
     for hermes_root in (_HERMES_HOME, _HERMES_ROOT):
-        denied.append(hermes_root / ".env")
-        denied.append(hermes_root / "auth.json")
-        denied.append(hermes_root / "credentials")
-        denied.append(hermes_root / "config.yaml")
+        for rel in _ROOT_CREDENTIAL_FILES:
+            denied.append(hermes_root / rel)
+        for rel in _ROOT_CREDENTIAL_DIRS:
+            denied.append(hermes_root / rel)
     return denied
 
 
@@ -1190,9 +1226,12 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
             return str(resolved)
 
     # Non-strict mode (default): accept anything not on the denylist.
-    # The denylist still blocks /etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env,
-    # ~/.hermes/auth.json, etc. — so the obvious prompt-injection sites
-    # (``MEDIA:/etc/passwd``, ``MEDIA:~/.ssh/id_rsa``) remain rejected.
+    # The denylist still blocks /etc, /proc, ~/.ssh, ~/.aws, and the
+    # credential/secret stores under the Hermes root (~/.hermes/.env,
+    # auth.json, .anthropic_oauth.json, google_token.json, pairing/, ...) —
+    # so the obvious prompt-injection / credential-exfil sites
+    # (``MEDIA:/etc/passwd``, ``MEDIA:~/.ssh/id_rsa``,
+    # ``MEDIA:~/.hermes/google_token.json``) remain rejected.
     if not _media_delivery_strict_mode():
         if _path_under_denied_prefix(resolved):
             return None
@@ -1704,6 +1743,9 @@ class SendResult:
     # stream consumer can send the missing tail instead of marking a clipped
     # response complete.
     retryable: bool = False  # True for transient connection errors — base will retry automatically
+    # Server-requested retry delay in seconds (e.g. Telegram FloodWait retry_after).
+    # When present, _send_with_retry() honors this instead of its default backoff.
+    retry_after: Optional[float] = None
     # When the adapter had to split an oversized payload across multiple
     # platform messages (e.g. Telegram edit_message overflow split-and-deliver),
     # ``message_id`` is the LAST visible message id (so subsequent edits target
@@ -3721,9 +3763,16 @@ class BasePlatformAdapter(ABC):
             return result
 
         if is_network:
-            # Retry with exponential backoff for transient errors
+            # Retry with exponential backoff for transient errors.
+            # Honor server-requested retry_after (e.g. Telegram FloodWait)
+            # when present — it is authoritative over our backoff schedule.
+            server_retry_after = result.retry_after
             for attempt in range(1, max_retries + 1):
-                delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                if server_retry_after is not None:
+                    delay = server_retry_after + random.uniform(0, 1)
+                    server_retry_after = None  # only honor once per send
+                else:
+                    delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
                 logger.warning(
                     "[%s] Send failed (attempt %d/%d, retrying in %.1fs): %s",
                     self.name, attempt, max_retries, delay, error_str,
@@ -3739,6 +3788,8 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
                 error_str = result.error or ""
+                if result.retry_after is not None:
+                    server_retry_after = result.retry_after
                 if not (result.retryable or self._is_retryable_error(error_str)):
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
@@ -4937,8 +4988,27 @@ class BasePlatformAdapter(ABC):
                 # same session.
                 current_task = asyncio.current_task()
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
-                    del self._session_tasks[session_key]
-                    self._release_session_guard(session_key, guard=interrupt_event)
+                    self._cleanup_finished_session_task(session_key, interrupt_event)
+    
+    def _cleanup_finished_session_task(
+        self, session_key: str, interrupt_event: Optional[asyncio.Event]
+    ) -> None:
+        """Release the session guard for a finished owner task, then drop its
+        ``_session_tasks`` entry ONLY if the guard was actually released.
+
+        Release-then-conditional-delete is the #48300 fix: when a concurrent
+        path (reset/new command, drain handoff) swapped ``_active_sessions[key]``
+        to a different guard, ``_release_session_guard`` skips on the guard
+        mismatch and the lock stays installed. If we deleted ``_session_tasks``
+        unconditionally (the old order), ``_session_task_is_stale`` would later
+        see no owner task and report "not stale", so the orphaned guard would
+        never be healed — a permanent session deadlock. Keeping the done-task
+        entry when the guard survives lets the on-entry self-heal detect the
+        stale lock and clear it on the next inbound message.
+        """
+        self._release_session_guard(session_key, guard=interrupt_event)
+        if session_key not in self._active_sessions:
+            self._session_tasks.pop(session_key, None)
     
     async def cancel_background_tasks(self) -> None:
         """Cancel any in-flight background message-processing tasks.
