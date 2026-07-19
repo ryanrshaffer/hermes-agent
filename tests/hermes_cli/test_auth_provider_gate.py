@@ -44,9 +44,43 @@ def test_returns_true_when_active_provider_matches(tmp_path, monkeypatch):
     assert is_provider_explicitly_configured("anthropic") is True
 
 
+def test_returns_true_when_credential_pool_has_provider_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "anthropic": [{
+                "id": "cred-1",
+                "label": "claude-oauth",
+                "auth_type": "oauth",
+                "source": "claude_code",
+                "access_token": "sk-ant-oat01-token",
+                "refresh_token": "refresh-token",
+            }],
+        },
+    })
+
+    from hermes_cli.auth import is_provider_explicitly_configured
+    assert is_provider_explicitly_configured("anthropic") is True
+
+
 def test_returns_true_when_config_provider_matches(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_config(tmp_path, {"model": {"provider": "anthropic", "default": "claude-sonnet-4-6"}})
+
+    from hermes_cli.auth import is_provider_explicitly_configured
+    assert is_provider_explicitly_configured("anthropic") is True
+
+
+def test_returns_true_when_auxiliary_provider_matches(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_config(tmp_path, {
+        "model": {"provider": "openai-codex", "default": "gpt-5.5"},
+        "auxiliary": {
+            "compression": {"provider": "anthropic", "model": "claude-haiku-4-5"},
+        },
+    })
 
     from hermes_cli.auth import is_provider_explicitly_configured
     assert is_provider_explicitly_configured("anthropic") is True

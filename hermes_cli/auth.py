@@ -1352,8 +1352,10 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
 
     Checks:
       1. active_provider in auth.json matches
-      2. model.provider in config.yaml matches
-      3. Provider-specific env vars are set (e.g. ANTHROPIC_API_KEY)
+      2. credential_pool in auth.json has a usable provider entry
+      3. model.provider in config.yaml matches
+      4. auxiliary.<task>.provider in config.yaml matches
+      5. Provider-specific env vars are set (e.g. ANTHROPIC_API_KEY)
 
     This is used to gate auto-discovery of external credentials (e.g.
     Claude Code's ~/.claude/.credentials.json) so they are never used
@@ -1368,10 +1370,21 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
         active = (auth_store.get("active_provider") or "").strip().lower()
         if active and active == normalized:
             return True
+        pool = auth_store.get("credential_pool")
+        entries = pool.get(normalized) if isinstance(pool, dict) else None
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                if any(
+                    has_usable_secret(str(entry.get(key) or ""))
+                    for key in ("access_token", "refresh_token", "api_key", "agent_key")
+                ):
+                    return True
     except Exception:
         pass
 
-    # 2. Check config.yaml model.provider
+    # 3. Check config.yaml model.provider
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
@@ -1380,10 +1393,18 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
             cfg_provider = (model_cfg.get("provider") or "").strip().lower()
             if cfg_provider == normalized:
                 return True
+        aux_cfg = cfg.get("auxiliary")
+        if isinstance(aux_cfg, dict):
+            for task_cfg in aux_cfg.values():
+                if not isinstance(task_cfg, dict):
+                    continue
+                aux_provider = (task_cfg.get("provider") or "").strip().lower()
+                if aux_provider == normalized:
+                    return True
     except Exception:
         pass
 
-    # 3. Check provider-specific env vars
+    # 5. Check provider-specific env vars
     # Exclude CLAUDE_CODE_OAUTH_TOKEN — it's set by Claude Code itself,
     # not by the user explicitly configuring anthropic in Hermes.
     _IMPLICIT_ENV_VARS = {"CLAUDE_CODE_OAUTH_TOKEN"}
