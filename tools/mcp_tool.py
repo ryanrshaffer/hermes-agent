@@ -84,6 +84,7 @@ Thread safety:
 import asyncio
 import contextvars
 import concurrent.futures
+from contextlib import AsyncExitStack
 import inspect
 import json
 import logging
@@ -1792,9 +1793,8 @@ class MCPServerTask:
         if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
             sampling_kwargs["message_handler"] = self._make_message_handler()
 
-        # Snapshot child PIDs before spawning so we can track the new one.
-        pids_before = _snapshot_child_pids()
         new_pids: set = set()
+        owned_start_times: Dict[int, float] = {}
         # Redirect subprocess stderr into a shared log file so MCP servers
         # (FastMCP banners, slack-mcp startup JSON, etc.) don't dump onto
         # the user's TTY and corrupt the TUI.  Preserves debuggability via
@@ -1802,40 +1802,80 @@ class MCPServerTask:
         _write_stderr_log_header(self.name)
         _errlog = _get_mcp_stderr_log()
         try:
-            async with stdio_client(server_params, errlog=_errlog) as (
-                read_stream,
-                write_stream,
-            ):
-                # Capture the newly spawned subprocess PID for force-kill cleanup.
-                new_pids = _snapshot_child_pids() - pids_before
-                if new_pids:
-                    # Capture pgid while the child is alive — once it exits we
-                    # can no longer call ``os.getpgid`` on it, and the cleanup
-                    # sweep needs the pgid to reach any reparented descendants
-                    # (e.g. ``claude mcp serve`` spawned by a stdio wrapper).
-                    new_pgids: Dict[int, int] = {}
-                    for _pid in new_pids:
-                        try:
-                            new_pgids[_pid] = os.getpgid(_pid)
-                        except (AttributeError, ProcessLookupError, OSError):
-                            # AttributeError: Windows (os.getpgid is POSIX-only)
-                            # ProcessLookupError: child raced and already exited
-                            pass
-                    with _lock:
-                        for _pid in new_pids:
-                            _stdio_pids[_pid] = self.name
-                        _stdio_pgids.update(new_pgids)
-                async with ClientSession(
-                    read_stream, write_stream, **sampling_kwargs
-                ) as session:
-                    self.initialize_result = await session.initialize()
-                    self.session = session
-                    await self._discover_tools()
-                    self._ready.set()
-                    # stdio transport does not use OAuth, but we still honor
-                    # _reconnect_event (e.g. future manual /mcp refresh) for
-                    # consistency with _run_http.
-                    await self._wait_for_lifecycle_event()
+            async with AsyncExitStack() as transport_stack:
+                # The SDK does not expose the subprocess PID. Serialize only
+                # the spawn + process-snapshot window so concurrent MCP starts
+                # cannot claim one another's direct children. Transport
+                # handshakes and the full session lifetime remain parallel.
+                async with _get_stdio_spawn_lock():
+                    pids_before = _snapshot_child_pids()
+                    try:
+                        read_stream, write_stream = await transport_stack.enter_async_context(
+                            stdio_client(server_params, errlog=_errlog)
+                        )
+                    finally:
+                        # Capture ownership even when transport entry raises
+                        # after spawning; the outer finally can then reap it.
+                        candidate_pids = _snapshot_child_pids() - pids_before
+                        owned_start_times = {
+                            pid: started_at
+                            for pid in candidate_pids
+                            if (
+                                started_at := _inspect_stdio_process(
+                                    pid,
+                                    command,
+                                    list(args),
+                                )
+                            )
+                            is not None
+                        }
+                        new_pids = set(owned_start_times)
+                        rejected_pids = candidate_pids - new_pids
+                        if rejected_pids:
+                            logger.debug(
+                                "MCP server '%s' ignored unrelated child PID(s): %s",
+                                self.name,
+                                sorted(rejected_pids),
+                            )
+                        if new_pids:
+                            # Capture pgid while the child is alive — once it exits we
+                            # can no longer call ``os.getpgid`` on it, and the cleanup
+                            # sweep needs the pgid to reach any reparented descendants
+                            # (e.g. ``claude mcp serve`` spawned by a stdio wrapper).
+                            new_pgids: Dict[int, int] = {}
+                            for _pid in new_pids:
+                                try:
+                                    new_pgids[_pid] = os.getpgid(_pid)
+                                except (AttributeError, ProcessLookupError, OSError):
+                                    # AttributeError: Windows (os.getpgid is POSIX-only)
+                                    # ProcessLookupError: child raced and already exited
+                                    pass
+                            with _lock:
+                                for _pid in new_pids:
+                                    _stdio_pids[_pid] = self.name
+                                _stdio_pid_start_times.update(owned_start_times)
+                                _stdio_pgids.update(new_pgids)
+                try:
+                    async with ClientSession(
+                        read_stream, write_stream, **sampling_kwargs
+                    ) as session:
+                        self.initialize_result = await session.initialize()
+                        self.session = session
+                        await self._discover_tools()
+                        # Record the live wrapper tree before entering the
+                        # long-lived lifecycle wait. If the wrapper exits and
+                        # its helpers are reparented later, the final capture
+                        # can no longer discover those descendants.
+                        _capture_stdio_descendants(new_pids)
+                        self._ready.set()
+                        # stdio transport does not use OAuth, but we still honor
+                        # _reconnect_event (e.g. future manual /mcp refresh) for
+                        # consistency with _run_http.
+                        await self._wait_for_lifecycle_event()
+                finally:
+                    # Capture while the stdio transport is still open, even
+                    # when ClientSession entry/initialize/discovery fails.
+                    _capture_stdio_descendants(new_pids)
         finally:
             # Runs on clean exit, exceptions, AND asyncio cancellation.
             # If any of the spawned PIDs are still alive, the SDK's
@@ -1843,33 +1883,58 @@ class MCPServerTask:
             # on Linux, where setsid() children escape the parent cgroup).
             # Mark them as orphans so the next cleanup sweep can reap them.
             if new_pids:
-                from gateway.status import _pid_exists
-                _killpg = getattr(os, "killpg", None)
-                with _lock:
-                    for _pid in new_pids:
-                        _stdio_pids.pop(_pid, None)
-                    for pid in new_pids:
-                        # ``os.kill(pid, 0)`` is NOT a no-op on Windows
-                        # (bpo-14484). Use the cross-platform check.
-                        pid_alive = _pid_exists(pid)
-                        pgroup_alive = False
-                        pgid = _stdio_pgids.get(pid)
-                        if not pid_alive and pgid is not None and _killpg is not None:
-                            # Direct child exited but descendants may still be
-                            # in its pgroup (e.g. ``claude mcp serve`` spawned
-                            # by an MCP wrapper that exited first).  Probe with
-                            # signal 0 — succeeds iff any pgroup member is alive.
-                            try:
-                                _killpg(pgid, 0)
-                                pgroup_alive = True
-                            except (ProcessLookupError, PermissionError, OSError):
-                                pgroup_alive = False
-                        if pid_alive or pgroup_alive:
-                            _orphan_stdio_pids.add(pid)
-                        else:
-                            # Nothing left to reap — drop the pgid entry so
-                            # PID-reuse can't surface stale pgroup state later.
-                            _stdio_pgids.pop(pid, None)
+                released_pids = _release_stdio_ownership(
+                    self.name,
+                    new_pids,
+                    owned_start_times,
+                )
+
+                if os.name == "nt" and released_pids:
+                    # Reap verified wrapper trees immediately. A bare Windows
+                    # PID is never deferred to the periodic cron sweep.
+                    surviving_roots = _cleanup_windows_stdio_processes(released_pids)
+                    with _lock:
+                        for pid in released_pids:
+                            if pid in surviving_roots:
+                                _orphan_stdio_pids.add(pid)
+                                continue
+                            if (
+                                pid not in _stdio_pids
+                                and _stdio_pid_start_times.get(pid)
+                                == owned_start_times.get(pid)
+                            ):
+                                _stdio_pid_start_times.pop(pid, None)
+                                _stdio_descendant_start_times.pop(pid, None)
+                                _stdio_pgids.pop(pid, None)
+                elif released_pids:
+                    from gateway.status import _pid_exists
+
+                    _killpg = getattr(os, "killpg", None)
+                    with _lock:
+                        for pid in released_pids:
+                            pid_alive = _pid_exists(pid)
+                            pgroup_alive = False
+                            pgid = _stdio_pgids.get(pid)
+                            if (
+                                not pid_alive
+                                and pgid is not None
+                                and _killpg is not None
+                            ):
+                                try:
+                                    _killpg(pgid, 0)
+                                    pgroup_alive = True
+                                except (
+                                    ProcessLookupError,
+                                    PermissionError,
+                                    OSError,
+                                ):
+                                    pgroup_alive = False
+                            if pid_alive or pgroup_alive:
+                                _orphan_stdio_pids.add(pid)
+                            else:
+                                _stdio_pgids.pop(pid, None)
+                                _stdio_pid_start_times.pop(pid, None)
+                                _stdio_descendant_start_times.pop(pid, None)
 
     # Content types a real MCP Streamable-HTTP endpoint may return on the
     # initial POST/GET. Anything else on a 2xx response means the URL is not
@@ -2814,12 +2879,13 @@ _lock = threading.Lock()
 # fails or times out.  PIDs are added after connection and removed on
 # normal server shutdown.
 _stdio_pids: Dict[int, str] = {}  # pid -> server_name
+_stdio_pid_start_times: Dict[int, float] = {}  # pid -> create_time
+_stdio_descendant_start_times: Dict[int, Dict[int, float]] = {}
 
-# PIDs that survived their session context exit (SDK teardown failed to
-# terminate them).  These are detected in _run_stdio's finally block and
-# can be cleaned up asynchronously by _kill_orphaned_mcp_children().
-# Separate from _stdio_pids so cleanup sweeps never race with active
-# sessions (e.g. concurrent cron jobs or live user chats).
+# POSIX PIDs that survived their session context exit (SDK teardown failed to
+# terminate them). Windows wrapper trees are cleaned immediately from verified
+# start-time/descendant fingerprints and are never deferred as bare PIDs.
+# Separate from _stdio_pids so cleanup sweeps never race with active sessions.
 _orphan_stdio_pids: set = set()
 
 # Process-group IDs of stdio MCP subprocesses, captured at spawn time.
@@ -2834,6 +2900,193 @@ _orphan_stdio_pids: set = set()
 # exited and been removed from the active map.  Empty on Windows
 # (``os.getpgid`` is POSIX-only).
 _stdio_pgids: Dict[int, int] = {}  # pid -> pgid
+
+# The SDK does not expose its stdio child PID, so _run_stdio identifies it
+# through a before/after process snapshot. This asyncio lock serializes only
+# that narrow spawn window on the dedicated MCP event loop. The loop identity
+# is retained so test loops and a recreated production loop never reuse a lock
+# bound to a closed loop.
+_stdio_spawn_lock: Optional[asyncio.Lock] = None
+_stdio_spawn_lock_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _get_stdio_spawn_lock() -> asyncio.Lock:
+    """Return the spawn-ownership lock for the current MCP event loop."""
+    global _stdio_spawn_lock, _stdio_spawn_lock_loop
+    loop = asyncio.get_running_loop()
+    if _stdio_spawn_lock is None or _stdio_spawn_lock_loop is not loop:
+        _stdio_spawn_lock = asyncio.Lock()
+        _stdio_spawn_lock_loop = loop
+    return _stdio_spawn_lock
+
+
+def _inspect_stdio_process(
+    pid: int,
+    command: str,
+    args: List[str],
+) -> Optional[float]:
+    """Return a matching child process start time, or ``None``.
+
+    The process snapshot is process-wide, so a PID delta alone is not proof
+    that the MCP transport spawned it. Require the configured executable and
+    argument prefix before assigning ownership.
+    """
+    try:
+        import psutil
+
+        process = psutil.Process(pid)
+        command_line = process.cmdline()
+        started_at = float(process.create_time())
+    except Exception:
+        return None
+    if not command_line or not math.isfinite(started_at):
+        return None
+
+    expected_command = os.path.normcase(os.path.abspath(command))
+    actual_command = os.path.normcase(os.path.abspath(command_line[0]))
+    if actual_command != expected_command:
+        return None
+
+    expected_args = [str(value) for value in args]
+    actual_args = command_line[1 : 1 + len(expected_args)]
+    if os.name == "nt":
+        expected_args = [value.casefold() for value in expected_args]
+        actual_args = [value.casefold() for value in actual_args]
+    if actual_args != expected_args:
+        return None
+    return started_at
+
+
+def _process_matches_start_time(pid: int, expected: float) -> bool:
+    """Return whether ``pid`` still names the exact captured process."""
+    try:
+        import psutil
+
+        actual = float(psutil.Process(pid).create_time())
+    except Exception:
+        return False
+    return abs(actual - expected) < 0.01
+
+
+def _capture_stdio_descendants(root_pids: set) -> None:
+    """Capture descendant identities while each owned wrapper is still live."""
+    if os.name != "nt" or not root_pids:
+        return
+    try:
+        import psutil
+    except ImportError:
+        return
+
+    captured: Dict[int, Dict[int, float]] = {}
+    for root_pid in root_pids:
+        try:
+            root = psutil.Process(root_pid)
+            descendants = {
+                child.pid: float(child.create_time())
+                for child in root.children(recursive=True)
+            }
+        except Exception:
+            continue
+        captured[root_pid] = descendants
+    if not captured:
+        return
+    with _lock:
+        for root_pid, descendants in captured.items():
+            _stdio_descendant_start_times.setdefault(root_pid, {}).update(descendants)
+
+
+def _release_stdio_ownership(
+    server_name: str,
+    root_pids: set,
+    owned_start_times: Dict[int, float],
+) -> set:
+    """Detach only the exact PID generation owned by this server run."""
+    released: set = set()
+    with _lock:
+        for pid in root_pids:
+            expected_start = owned_start_times.get(pid)
+            if _stdio_pid_start_times.get(pid) != expected_start:
+                continue
+            current_owner = _stdio_pids.get(pid)
+            if current_owner not in (None, server_name):
+                continue
+            if current_owner == server_name:
+                _stdio_pids.pop(pid, None)
+            released.add(pid)
+    return released
+
+
+def _cleanup_windows_stdio_processes(root_pids: set) -> set:
+    """Reap verified Windows trees and return roots needing a safe retry."""
+    if not root_pids:
+        return set()
+    import subprocess
+
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
+    with _lock:
+        active_pids = set(_stdio_pids)
+        root_start_times = {
+            pid: _stdio_pid_start_times.get(pid) for pid in root_pids
+        }
+        descendants = {
+            pid: dict(_stdio_descendant_start_times.get(pid, {}))
+            for pid in root_pids
+        }
+
+    targets: Dict[int, float] = {}
+    target_roots: Dict[int, set] = {}
+    for root_pid, root_started_at in root_start_times.items():
+        if root_pid in active_pids:
+            continue
+        if root_started_at is not None and _process_matches_start_time(
+            root_pid, root_started_at
+        ):
+            targets[root_pid] = root_started_at
+            target_roots.setdefault(root_pid, set()).add(root_pid)
+        for child_pid, child_started_at in descendants.get(root_pid, {}).items():
+            if child_pid in active_pids:
+                continue
+            if _process_matches_start_time(child_pid, child_started_at):
+                targets[child_pid] = child_started_at
+                target_roots.setdefault(child_pid, set()).add(root_pid)
+
+    def taskkill_tree(pid: int, *, force: bool) -> None:
+        command = ["taskkill", "/PID", str(pid), "/T"]
+        if force:
+            command.append("/F")
+        try:
+            subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                creationflags=windows_hide_flags(),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.debug("taskkill tree cleanup failed for PID %d: %s", pid, exc)
+
+    for pid in targets:
+        taskkill_tree(pid, force=False)
+    if targets:
+        time.sleep(2)
+    for pid, started_at in targets.items():
+        if _process_matches_start_time(pid, started_at):
+            taskkill_tree(pid, force=True)
+
+    with _lock:
+        active_pids = set(_stdio_pids)
+    surviving_roots: set = set()
+    for pid, started_at in targets.items():
+        if pid not in active_pids and _process_matches_start_time(pid, started_at):
+            surviving_roots.update(target_roots.get(pid, set()))
+    if surviving_roots:
+        logger.warning(
+            "Verified Windows MCP process tree cleanup needs retry for root PID(s): %s",
+            sorted(surviving_roots),
+        )
+    return surviving_roots
 
 
 def _snapshot_child_pids() -> set:
@@ -3095,6 +3348,44 @@ def _load_mcp_config() -> Dict[str, dict]:
 # Server connection helper
 # ---------------------------------------------------------------------------
 
+async def _shutdown_unpublished_server(
+    name: str,
+    server: MCPServerTask,
+) -> Optional[asyncio.CancelledError]:
+    """Finish teardown before a failed connection drops server ownership."""
+    shutdown_task = asyncio.create_task(server.shutdown())
+    deferred_cancellation: Optional[asyncio.CancelledError] = None
+    shutdown_error: Optional[Exception] = None
+    while not shutdown_task.done():
+        try:
+            await asyncio.shield(shutdown_task)
+        except asyncio.CancelledError as exc:
+            current_task = asyncio.current_task()
+            caller_cancelled = (
+                current_task is not None and current_task.cancelling() > 0
+            )
+            if caller_cancelled and deferred_cancellation is None:
+                deferred_cancellation = exc
+            if shutdown_task.cancelled():
+                shutdown_error = RuntimeError("shutdown task was cancelled")
+        except Exception as exc:
+            shutdown_error = exc
+    if shutdown_error is None and shutdown_task.cancelled():
+        shutdown_error = RuntimeError("shutdown task was cancelled")
+    elif shutdown_error is None:
+        try:
+            shutdown_task.result()
+        except Exception as exc:
+            shutdown_error = exc
+    if shutdown_error is not None:
+        logger.warning(
+            "MCP server '%s' cleanup after failed connect failed: %s",
+            name,
+            shutdown_error,
+        )
+    return deferred_cancellation
+
+
 async def _connect_server(name: str, config: dict) -> MCPServerTask:
     """Create an MCPServerTask, start it, and return when ready.
 
@@ -3107,7 +3398,19 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         Exception: on connection or initialization failure.
     """
     server = MCPServerTask(name)
-    await server.start(config)
+    try:
+        await server.start(config)
+    except asyncio.CancelledError:
+        # A connect timeout cancels only this waiter. MCPServerTask.start()
+        # already created an independent long-lived task, so explicitly shut
+        # it down before dropping the last reference to the server.
+        await _shutdown_unpublished_server(name, server)
+        raise
+    except Exception:
+        deferred_cancellation = await _shutdown_unpublished_server(name, server)
+        if deferred_cancellation is not None:
+            raise deferred_cancellation
+        raise
     return server
 
 
@@ -4615,8 +4918,8 @@ def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
     On POSIX, signals are sent via ``os.killpg`` to the spawn-time pgid when
     one is tracked, so reparented grandchildren in the same process group
     (e.g. ``claude mcp serve`` spawned by a stdio MCP wrapper that exited
-    first) are reaped alongside the direct child.  Falls back to ``os.kill``
-    on Windows and when no pgid is recorded.
+    first) are reaped alongside the direct child. It falls back to ``os.kill``
+    when no pgid is recorded. Windows uses verified ``taskkill /T`` trees.
 
     With ``include_active=True`` also kills every PID in ``_stdio_pids`` —
     used only at final shutdown, after the MCP event loop has stopped and no
@@ -4627,7 +4930,8 @@ def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
     with _lock:
         pids: Dict[int, str] = {}
         for opid in _orphan_stdio_pids:
-            pids[opid] = "orphan"
+            if opid not in _stdio_pids:
+                pids[opid] = "orphan"
         _orphan_stdio_pids.clear()
         if include_active:
             pids.update(dict(_stdio_pids))
@@ -4641,6 +4945,18 @@ def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
     # Fast path: no tracked stdio PIDs to reap. Skip the SIGTERM/sleep/SIGKILL
     # dance entirely — otherwise every MCP-free shutdown pays a 2s sleep tax.
     if not pids:
+        return
+
+    if os.name == "nt":
+        surviving_roots = _cleanup_windows_stdio_processes(set(pids))
+        with _lock:
+            for pid in pids:
+                if pid in surviving_roots:
+                    _orphan_stdio_pids.add(pid)
+                    continue
+                _stdio_pid_start_times.pop(pid, None)
+                _stdio_descendant_start_times.pop(pid, None)
+                _stdio_pgids.pop(pid, None)
         return
 
     # Pre-compute the gateway's own pgid so _send_signal can avoid killing it.
