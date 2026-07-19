@@ -170,6 +170,57 @@ class TestSyncMode:
         time.sleep(0.1)
         sched._shutdown_parallel_pool()
 
+    def test_queued_job_lease_renews_before_worker_starts(self, tmp_path, monkeypatch):
+        """Pool saturation must not let a legitimately queued lease expire."""
+        import cron.scheduler as sched
+
+        sched._parallel_pool = None
+        sched._parallel_pool_max_workers = None
+        sched._running_job_ids.clear()
+        monkeypatch.setenv("HERMES_CRON_MAX_PARALLEL", "1")
+        monkeypatch.setattr(sched, "ATTEMPT_LEASE_RENEW_INTERVAL_SECONDS", 0.01)
+
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
+        second_renewed = threading.Event()
+        jobs = [
+            {"id": "first", "name": "first", "deliver": "local"},
+            {"id": "second", "name": "second", "deliver": "local"},
+        ]
+
+        def run_job(job):
+            if job["id"] == "first":
+                first_started.set()
+                assert release_first.wait(timeout=2)
+            else:
+                second_started.set()
+            return True, "out", "response", None
+
+        def renew(job_id, attempt_token):
+            if job_id == "second":
+                second_renewed.set()
+            return True
+
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
+        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "renew_attempt_lease", renew)
+        monkeypatch.setattr(sched, "run_job", run_job)
+        monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
+        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
+
+        try:
+            assert sched.tick(verbose=False, sync=False) == 2
+            assert first_started.wait(timeout=1)
+            assert second_renewed.wait(timeout=1)
+            assert not second_started.is_set()
+        finally:
+            release_first.set()
+            sched._shutdown_parallel_pool()
+
+        assert second_started.is_set()
+
 
 class TestSequentialPool:
     """Sequential (workdir) jobs use the persistent cron-seq pool.

@@ -18,7 +18,9 @@ from cron.jobs import (
     resume_job,
     remove_job,
     mark_job_run,
+    failure_signature,
     advance_next_run,
+    renew_attempt_lease,
     get_due_jobs,
     save_job_output,
 )
@@ -485,6 +487,20 @@ class TestResolveJobRef:
 
 
 class TestMarkJobRun:
+    def test_failure_signature_ignores_dynamic_age_but_not_changed_cause(self):
+        assert failure_signature("browser report 664 hours old") == failure_signature(
+            "browser report 665 hours old"
+        )
+        assert failure_signature("browser report 664.2h old") == failure_signature(
+            "browser report 665.7h old"
+        )
+        assert failure_signature("missing account export") != failure_signature(
+            "missing transaction export"
+        )
+        assert failure_signature("missing report for 2026-07-12") != failure_signature(
+            "missing report for 2026-07-13"
+        )
+
     def test_increments_completed(self, tmp_cron_dir):
         job = create_job(prompt="Test", schedule="every 1h")
         mark_job_run(job["id"], success=True)
@@ -522,15 +538,81 @@ class TestMarkJobRun:
         updated = get_job(job["id"])
         assert updated["last_status"] == "error"
         assert updated["last_error"] == "timeout"
+        assert updated["repeat"]["completed"] == 0
+        assert updated["consecutive_failures"] == 1
+        assert updated["retry_scheduled_for"] == updated["next_run_at"]
 
-    def test_delivery_error_tracked_separately(self, tmp_cron_dir):
-        """Agent succeeds but delivery fails — both tracked independently."""
+    def test_failed_finite_job_is_retained_until_success(self, tmp_cron_dir):
+        job = create_job(prompt="Finish once", schedule="30m", repeat=1)
+
+        mark_job_run(job["id"], success=False, error="source stale")
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["repeat"]["completed"] == 0
+        assert updated["last_status"] == "error"
+
+        mark_job_run(job["id"], success=True)
+        assert get_job(job["id"]) is None
+
+    def test_failures_back_off_and_success_resets_streak(self, tmp_cron_dir):
+        job = create_job(prompt="Poll", schedule="every 1m")
+
+        mark_job_run(job["id"], success=False, error="partial")
+        first = get_job(job["id"])
+        first_delay = (
+            datetime.fromisoformat(first["next_run_at"])
+            - datetime.fromisoformat(first["last_run_at"])
+        )
+        assert first_delay == timedelta(minutes=30)
+
+        mark_job_run(job["id"], success=False, error="partial")
+        second = get_job(job["id"])
+        second_delay = (
+            datetime.fromisoformat(second["next_run_at"])
+            - datetime.fromisoformat(second["last_run_at"])
+        )
+        assert second["consecutive_failures"] == 2
+        assert second_delay == timedelta(minutes=60)
+
+        mark_job_run(job["id"], success=True)
+        recovered = get_job(job["id"])
+        assert recovered["last_status"] == "ok"
+        assert recovered["consecutive_failures"] == 0
+        assert recovered["retry_scheduled_for"] is None
+        assert recovered["last_success_at"] == recovered["last_run_at"]
+
+    def test_delivery_error_keeps_objective_incomplete(self, tmp_cron_dir):
+        """Generation without confirmed delivery is not a completed objective."""
         job = create_job(prompt="Report", schedule="every 1h")
         mark_job_run(job["id"], success=True, delivery_error="platform 'telegram' not configured")
         updated = get_job(job["id"])
-        assert updated["last_status"] == "ok"
-        assert updated["last_error"] is None
+        assert updated["last_status"] == "error"
+        assert updated["last_error"].startswith("Delivery incomplete:")
         assert updated["last_delivery_error"] == "platform 'telegram' not configured"
+        assert updated["repeat"]["completed"] == 0
+        assert updated["retry_scheduled_for"] == updated["next_run_at"]
+
+    def test_failure_notice_timestamp_survives_suppressed_retries(self, tmp_cron_dir):
+        job = create_job(prompt="Watch", schedule="every 1h")
+        mark_job_run(
+            job["id"],
+            success=False,
+            error="source 12 hours old",
+            failure_notified=True,
+        )
+        first = get_job(job["id"])
+        notified_at = first["last_failure_notified_at"]
+
+        mark_job_run(
+            job["id"],
+            success=False,
+            error="source 13 hours old",
+            failure_notified=False,
+        )
+        second = get_job(job["id"])
+        assert second["last_failure_signature"] == first["last_failure_signature"]
+        assert second["last_failure_notified_at"] == notified_at
 
     def test_delivery_error_cleared_on_success(self, tmp_cron_dir):
         """Successful delivery clears the previous delivery error."""
@@ -559,8 +641,8 @@ class TestMarkJobRun:
         If the gateway runs in an env where `croniter` went missing after a
         recurring cron job was persisted, `compute_next_run()` returns None.
         `mark_job_run()` must NOT treat that as terminal completion — the job
-        has to stay enabled with state=error so the user notices, rather than
-        silently flipping to enabled=false, state=completed.
+        has to stay enabled with a persisted retry rather than silently
+        flipping to enabled=false, state=completed.
         """
         pytest.importorskip("croniter")  # need it to create the job
         job = create_job(prompt="Recurring", schedule="0 7,15,23 * * *")
@@ -578,15 +660,18 @@ class TestMarkJobRun:
             "recurring cron job was disabled despite croniter-missing being "
             "a runtime dep issue, not a terminal completion"
         )
-        assert updated["state"] == "error"
+        assert updated["state"] == "scheduled"
         assert updated["state"] != "completed"
-        assert updated["next_run_at"] is None
+        assert updated["next_run_at"] is not None
+        assert updated["retry_scheduled_for"] == updated["next_run_at"]
+        assert updated["last_status"] == "error"
+        assert updated["repeat"]["completed"] == 0
         assert updated["last_error"]
         assert "croniter" in updated["last_error"].lower()
 
     def test_recurring_interval_not_disabled_when_next_run_is_none(self, tmp_cron_dir, monkeypatch):
         """Defensive sibling of the cron test — any recurring schedule that
-        somehow yields next_run_at=None must stay enabled with state=error.
+        somehow yields next_run_at=None must stay enabled with a retry.
         """
         job = create_job(prompt="Recurring", schedule="every 1h")
         assert job["schedule"]["kind"] == "interval"
@@ -601,8 +686,12 @@ class TestMarkJobRun:
         updated = get_job(job["id"])
         assert updated is not None
         assert updated["enabled"] is True
-        assert updated["state"] == "error"
+        assert updated["state"] == "scheduled"
         assert updated["state"] != "completed"
+        assert updated["next_run_at"] is not None
+        assert updated["retry_scheduled_for"] == updated["next_run_at"]
+        assert updated["last_status"] == "error"
+        assert updated["repeat"]["completed"] == 0
 
     def test_oneshot_still_completes_when_next_run_is_none(self, tmp_cron_dir):
         """One-shot jobs must still flip to enabled=false, state=completed
@@ -655,6 +744,8 @@ class TestAdvanceNextRun:
         from cron.jobs import _ensure_aware, _hermes_now
         new_next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
         assert new_next_dt > _hermes_now(), "next_run_at should be in the future after advance"
+        assert updated["attempt_started_at"] is not None
+        assert updated["attempt_lease_expires_at"] is not None
 
     def test_advances_cron_job(self, tmp_cron_dir):
         """Cron-expression jobs should have next_run_at bumped to the next occurrence."""
@@ -674,8 +765,8 @@ class TestAdvanceNextRun:
         new_next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
         assert new_next_dt > _hermes_now(), "next_run_at should be in the future after advance"
 
-    def test_skips_oneshot_job(self, tmp_cron_dir):
-        """One-shot jobs should NOT be advanced — they need to retry on restart."""
+    def test_leases_oneshot_without_advancing_schedule(self, tmp_cron_dir):
+        """One-shots keep their fire time but gain crash-recovery state."""
         job = create_job(prompt="Run once", schedule="30m")
         original_next = get_job(job["id"])["next_run_at"]
 
@@ -684,6 +775,8 @@ class TestAdvanceNextRun:
 
         updated = get_job(job["id"])
         assert updated["next_run_at"] == original_next, "one-shot next_run_at should be unchanged"
+        assert updated["attempt_started_at"] is not None
+        assert updated["attempt_lease_expires_at"] is not None
 
     def test_nonexistent_job_returns_false(self, tmp_cron_dir):
         result = advance_next_run("nonexistent-id")
@@ -701,7 +794,7 @@ class TestAdvanceNextRun:
         assert new_next_dt > _hermes_now(), "next_run_at should remain in the future"
 
     def test_crash_safety_scenario(self, tmp_cron_dir):
-        """Simulate the crash-loop scenario: after advance, the job should NOT be due."""
+        """A freshly leased attempt must not duplicate while it may be running."""
         job = create_job(prompt="Crash test", schedule="every 1h")
         # Force next_run_at to 5 minutes ago (job is due)
         jobs = load_jobs()
@@ -715,9 +808,95 @@ class TestAdvanceNextRun:
         # Advance (simulating what tick() does before run_job)
         advance_next_run(job["id"])
 
-        # Now the job should NOT be due (simulates restart after crash)
+        # The fresh lease suppresses a duplicate until its recovery deadline.
         due_after = get_due_jobs()
         assert len(due_after) == 0, "Job should not be due after advance_next_run"
+
+    def test_expired_attempt_lease_recovers_incomplete_objective(self, tmp_cron_dir):
+        job = create_job(prompt="Recover me", schedule="every 1h")
+        now = datetime.now(timezone.utc)
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (now + timedelta(hours=1)).isoformat()
+        jobs[0]["attempt_started_at"] = (now - timedelta(hours=1)).isoformat()
+        jobs[0]["attempt_lease_expires_at"] = (now - timedelta(minutes=30)).isoformat()
+        jobs[0]["attempt_scheduled_for"] = (now - timedelta(hours=1)).isoformat()
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+
+        assert [item["id"] for item in due] == [job["id"]]
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "error"
+        assert "lease expired" in updated["last_error"]
+        assert updated["repeat"]["completed"] == 0
+        assert updated["consecutive_failures"] == 1
+        assert updated["attempt_started_at"] is None
+
+    def test_fresh_attempt_lease_prevents_duplicate_fire(self, tmp_cron_dir):
+        job = create_job(prompt="Still running", schedule="every 1h")
+        now = datetime.now(timezone.utc)
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (now - timedelta(minutes=5)).isoformat()
+        jobs[0]["attempt_started_at"] = now.isoformat()
+        jobs[0]["attempt_lease_expires_at"] = (now + timedelta(minutes=30)).isoformat()
+        save_jobs(jobs)
+
+        assert get_due_jobs() == []
+
+    def test_active_attempt_renews_past_original_expiry(self, tmp_cron_dir, monkeypatch):
+        """A live owner stays non-due after the original fixed lease window."""
+        import cron.jobs as jobs_module
+
+        start = datetime.now().astimezone().replace(microsecond=0)
+        monkeypatch.setattr(jobs_module, "_hermes_now", lambda: start)
+        job = create_job(prompt="Long worker", schedule="30m")
+        stored = load_jobs()
+        stored[0]["next_run_at"] = (start - timedelta(minutes=1)).isoformat()
+        save_jobs(stored)
+
+        token = "active-attempt"
+        advance_next_run(job["id"], attempt_token=token)
+        original_expiry = datetime.fromisoformat(
+            get_job(job["id"])["attempt_lease_expires_at"]
+        )
+
+        monkeypatch.setattr(
+            jobs_module,
+            "_hermes_now",
+            lambda: start + timedelta(minutes=20),
+        )
+        assert renew_attempt_lease(job["id"], token) is True
+        renewed_expiry = datetime.fromisoformat(
+            get_job(job["id"])["attempt_lease_expires_at"]
+        )
+        assert renewed_expiry > original_expiry
+
+        # The original lease is now expired, but the same live worker renewed
+        # it, so crash recovery must not produce a duplicate due job.
+        monkeypatch.setattr(
+            jobs_module,
+            "_hermes_now",
+            lambda: start + timedelta(minutes=35),
+        )
+        assert get_due_jobs() == []
+
+    def test_stale_attempt_cannot_renew_or_complete_new_owner(self, tmp_cron_dir):
+        job = create_job(prompt="Fence retries", schedule="every 1h")
+        advance_next_run(job["id"], attempt_token="old-owner")
+        advance_next_run(job["id"], attempt_token="new-owner")
+        before = get_job(job["id"])
+
+        assert renew_attempt_lease(job["id"], "old-owner") is False
+        mark_job_run(
+            job["id"],
+            success=True,
+            attempt_token="old-owner",
+        )
+
+        after = get_job(job["id"])
+        assert after["attempt_token"] == "new-owner"
+        assert after["attempt_lease_expires_at"] == before["attempt_lease_expires_at"]
+        assert after["last_run_at"] is None
 
 
 class TestGetDueJobs:
@@ -1182,7 +1361,7 @@ class TestMarkJobRunConcurrency:
         assert b["last_status"] == "error", f"Job B last_status wrong: {b['last_status']}"
         assert b["last_error"] == "timeout", f"Job B last_error wrong: {b['last_error']}"
         assert b["last_run_at"] is not None, "Job B last_run_at not set"
-        assert b["repeat"]["completed"] == 1, f"Job B completed count wrong: {b['repeat']['completed']}"
+        assert b["repeat"]["completed"] == 0, f"Job B incomplete attempt consumed completion count: {b['repeat']['completed']}"
 
         assert c["last_status"] == "ok", f"Job C last_status wrong: {c['last_status']}"
         assert c["last_run_at"] is not None, "Job C last_run_at not set"
@@ -1229,6 +1408,21 @@ class TestSaveJobOutput:
         assert output_file.exists()
         assert output_file.read_text() == "# Results\nEverything ok."
         assert "test123" in str(output_file)
+
+    def test_silent_heartbeats_replace_one_file(self, tmp_cron_dir):
+        first = save_job_output(
+            "poller",
+            "# Cron Job: Poller\n\n**Status:** silent (empty output)\n",
+        )
+        second = save_job_output(
+            "poller",
+            "# Cron Job: Poller\n\n**Status:** silent (wakeAgent=false)\n",
+        )
+
+        assert first == second
+        assert second.name == "latest-silent.md"
+        assert "wakeAgent=false" in second.read_text(encoding="utf-8")
+        assert list(second.parent.glob("*.md")) == [second]
 
     @pytest.mark.parametrize("bad_job_id", ["../escape", "nested/escape", ".", "..", ""])
     def test_rejects_unsafe_job_id(self, tmp_cron_dir, bad_job_id):

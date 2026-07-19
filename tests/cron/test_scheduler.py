@@ -3,7 +3,7 @@
 import json
 import logging
 import os
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import ANY, AsyncMock, patch, MagicMock
 
 import pytest
 
@@ -512,7 +512,8 @@ class TestRoutingIntents:
                     "SIGNAL_HOME_CHANNEL", "MATRIX_HOME_ROOM", "MATTERMOST_HOME_CHANNEL",
                     "SMS_HOME_CHANNEL", "EMAIL_HOME_ADDRESS", "DINGTALK_HOME_CHANNEL",
                     "FEISHU_HOME_CHANNEL", "WECOM_HOME_CHANNEL", "WEIXIN_HOME_CHANNEL",
-                    "BLUEBUBBLES_HOME_CHANNEL", "QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL"):
+                    "BLUEBUBBLES_HOME_CHANNEL", "QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL",
+                    "PHOTON_HOME_CHANNEL"):
             monkeypatch.delenv(var, raising=False)
 
         assert _resolve_delivery_targets({"deliver": "all", "origin": None}) == []
@@ -544,6 +545,7 @@ class TestRoutingIntents:
 
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
+        monkeypatch.delenv("PHOTON_HOME_CHANNEL", raising=False)
 
         for token in ("ALL", "All", "all"):
             targets = _resolve_delivery_targets({"deliver": token, "origin": None})
@@ -638,6 +640,33 @@ class TestDeliverResultWrapping:
         assert sent_content == "Clean output only."
         assert "Cronjob Response" not in sent_content
         assert "The agent cannot see" not in sent_content
+
+    def test_delivery_skips_wrapping_when_job_disabled(self):
+        """A single job can opt out of the cron header/footer without changing global config."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": True}}):
+            job = {
+                "id": "test-job",
+                "name": "daily-report",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+                "wrap_response": False,
+            }
+            _deliver_result(job, "Job-specific clean output.")
+
+        send_mock.assert_called_once()
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent_content == "Job-specific clean output."
+        assert "Cronjob Response" not in sent_content
+        assert "To stop or manage this job" not in sent_content
 
     def test_delivery_extracts_media_tags_before_send(self, tmp_path, monkeypatch):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""
@@ -1394,14 +1423,44 @@ class TestRunJobSessionPersistence:
         assert error is None
         assert final_response == "all good"
 
-    def test_run_job_delivers_max_iteration_fallback_summary(self, tmp_path):
-        """Cron should deliver a usable max-iteration fallback summary.
+    def test_run_job_retry_marker_keeps_objective_incomplete(self, tmp_path):
+        job = {
+            "id": "retry-job",
+            "name": "retry",
+            "prompt": "produce a verified report",
+        }
+        fake_db = MagicMock()
 
-        A cron run can exhaust the iteration budget, get a final text summary
-        from the no-tools fallback call, and still have ``completed=False`` in
-        the generic agent result. That should not make cron raise the report
-        text as a RuntimeError.
-        """
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "[RETRY] source export is stale",
+                "completed": True,
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error == "Objective incomplete: source export is stale"
+        assert "[RETRY] source export is stale" in output
+
+    def test_run_job_retries_max_iteration_fallback_summary(self, tmp_path):
+        """A fallback summary is evidence, not proof the objective finished."""
         job = {
             "id": "summary-job",
             "name": "summary",
@@ -1434,11 +1493,10 @@ class TestRunJobSessionPersistence:
 
             success, output, final_response, error = run_job(job)
 
-        assert success is True
-        assert error is None
-        assert final_response == "final fallback report"
-        assert "final fallback report" in output
-        assert "(FAILED)" not in output
+        assert success is False
+        assert "final fallback report" in error
+        assert final_response == ""
+        assert "(FAILED)" in output
 
     def test_tick_marks_empty_response_as_error(self, tmp_path):
         """When run_job returns success=True but final_response is empty,
@@ -2307,6 +2365,35 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_called_once()
 
+    def test_unchanged_retry_failure_is_not_redelivered(self):
+        from cron.jobs import failure_signature
+        from hermes_time import now as hermes_now
+
+        error = "browser report 665 hours old"
+        job = self._make_job() | {
+            "last_failure_signature": failure_signature(
+                "browser report 664 hours old"
+            ),
+            "last_failure_notified_at": hermes_now().isoformat(),
+        }
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.run_job", return_value=(False, "# output", "", error)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        deliver_mock.assert_not_called()
+        mark_mock.assert_called_once_with(
+            "monitor-job",
+            False,
+            error,
+            delivery_error=None,
+            failure_notified=False,
+            attempt_token=ANY,
+        )
+
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# full output", "[SILENT]", None)), \
@@ -2335,6 +2422,8 @@ class TestSilentDelivery:
             False,
             "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
             delivery_error=None,
+            failure_notified=False,
+            attempt_token=ANY,
         )
 
 
@@ -2345,6 +2434,8 @@ class TestBuildJobPromptSilentHint:
         job = {"prompt": "Check for updates"}
         result = _build_job_prompt(job)
         assert "[SILENT]" in result
+        assert "[RETRY]" in result
+        assert "stale, partial, inconsistent, unavailable, or unverified" in result
         assert "Check for updates" in result
 
     def test_hint_present_even_without_prompt(self):
@@ -2486,7 +2577,8 @@ class TestRunJobWakeGate:
         assert success is True
         assert err is None
         assert final == SILENT_MARKER
-        assert "Script gate returned `wakeAgent=false`" in doc
+        assert "**Mode:** agent (script gate)" in doc
+        assert "**Status:** silent (wakeAgent=false)" in doc
         agent_cls.assert_not_called()
 
     def test_wake_true_runs_agent_with_injected_output(self):
@@ -2520,7 +2612,8 @@ class TestRunJobWakeGate:
         import cron.scheduler as scheduler
 
         call_count = 0
-        def _script_stub(path):
+        def _script_stub(path, *, workdir=None):
+            assert workdir is None
             nonlocal call_count
             call_count += 1
             return (True, "regular output")

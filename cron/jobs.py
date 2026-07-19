@@ -7,6 +7,7 @@ Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
 
 import contextlib
 import copy
+import hashlib
 import json
 import logging
 import shutil
@@ -66,6 +67,19 @@ TICKER_SUCCESS_FILE = CRON_DIR / "ticker_last_success"
 # threshold in `hermes cron status` (hermes_cli/cron.py), so the two never
 # drift apart.
 TICKER_INTERVAL_SECONDS = 60
+
+# Failed objectives converge across cron runs instead of waiting for the next
+# daily/weekly/monthly fire. Script retries start quickly; agent-backed retries
+# start more slowly to avoid runaway token spend. Both keep retrying with a
+# bounded six-hour backoff until the job's acceptance criteria pass.
+SCRIPT_RETRY_BASE_SECONDS = 5 * 60
+AGENT_RETRY_BASE_SECONDS = 30 * 60
+FAILURE_RETRY_MAX_SECONDS = 6 * 60 * 60
+# A cron process normally enforces a ten-minute agent timeout and a two-minute
+# script timeout. A thirty-minute persistent lease leaves cleanup headroom but
+# still recovers an objective after a gateway/process crash.
+ATTEMPT_LEASE_SECONDS = 30 * 60
+FAILURE_REMINDER_SECONDS = 24 * 60 * 60
 
 # In-process lock protecting load_jobs→modify→save_jobs cycles.
 # Required when tick() runs jobs in parallel threads — without this,
@@ -247,6 +261,22 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     if not state:
         state = "scheduled" if normalized.get("enabled", True) else "paused"
     normalized["state"] = state
+
+    try:
+        normalized["consecutive_failures"] = max(
+            0, int(normalized.get("consecutive_failures") or 0)
+        )
+    except (TypeError, ValueError):
+        normalized["consecutive_failures"] = 0
+    normalized.setdefault("last_success_at", None)
+    normalized.setdefault("last_failure_at", None)
+    normalized.setdefault("retry_scheduled_for", None)
+    normalized.setdefault("attempt_started_at", None)
+    normalized.setdefault("attempt_lease_expires_at", None)
+    normalized.setdefault("attempt_scheduled_for", None)
+    normalized.setdefault("attempt_token", normalized.get("attempt_started_at"))
+    normalized.setdefault("last_failure_signature", None)
+    normalized.setdefault("last_failure_notified_at", None)
 
     return normalized
 
@@ -960,6 +990,16 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        "consecutive_failures": 0,
+        "last_success_at": None,
+        "last_failure_at": None,
+        "retry_scheduled_for": None,
+        "attempt_started_at": None,
+        "attempt_lease_expires_at": None,
+        "attempt_scheduled_for": None,
+        "attempt_token": None,
+        "last_failure_signature": None,
+        "last_failure_notified_at": None,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -1163,108 +1203,255 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
-    """
-    Mark a job as having been run.
-    
-    Updates last_run_at, last_status, increments completed count,
-    computes next_run_at, and auto-deletes if repeat limit reached.
+def _failure_retry_at(
+    job: Dict[str, Any],
+    now: datetime,
+    consecutive_failures: int,
+    *,
+    delivery_failed: bool = False,
+) -> str:
+    """Return the next bounded retry time for an incomplete objective."""
+    base_seconds = (
+        SCRIPT_RETRY_BASE_SECONDS if job.get("no_agent")
+        else AGENT_RETRY_BASE_SECONDS
+    )
+    if delivery_failed:
+        # Re-delivery may be externally visible, so never hammer a destination.
+        base_seconds = max(base_seconds, AGENT_RETRY_BASE_SECONDS)
 
-    ``delivery_error`` is tracked separately from the agent error — a job
-    can succeed (agent produced output) but fail delivery (platform down).
-    """
+    schedule = job.get("schedule") or {}
+    if schedule.get("kind") == "interval":
+        try:
+            interval_seconds = max(0, int(schedule.get("minutes") or 0) * 60)
+        except (TypeError, ValueError):
+            interval_seconds = 0
+        base_seconds = max(base_seconds, interval_seconds)
+
+    exponent = min(max(consecutive_failures - 1, 0), 16)
+    delay_seconds = min(
+        base_seconds * (2 ** exponent),
+        FAILURE_RETRY_MAX_SECONDS,
+    )
+    retry_at = now + timedelta(seconds=delay_seconds)
+
+    # A regular cron occurrence that arrives before backoff expires should not
+    # be skipped. Interval jobs intentionally use the backoff so a failing
+    # high-frequency poller cannot hammer a provider.
+    if schedule.get("kind") == "cron":
+        scheduled = compute_next_run(schedule, now.isoformat())
+        if scheduled:
+            scheduled_at = _ensure_aware(datetime.fromisoformat(scheduled))
+            if scheduled_at < retry_at:
+                retry_at = scheduled_at
+
+    return retry_at.isoformat()
+
+
+def failure_signature(error: Optional[str]) -> str:
+    """Return a stable, privacy-preserving identity for repeat failures."""
+    normalized = _coerce_job_text(error, "unknown failure").strip().lower()
+    normalized = re.sub(
+        r"\b\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:z|[+-]\d{2}:?\d{2})?\b",
+        "<timestamp>",
+        normalized,
+    )
+    normalized = re.sub(
+        r"\b\d+(?:\.\d+)?\s*(?:(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\s*(?:old|ago)?|(?:s|m|h|d)\s*(?:old|ago))\b",
+        "<age>",
+        normalized,
+    )
+    normalized = re.sub(r"\s+", " ", normalized)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
+                 delivery_error: Optional[str] = None,
+                 failure_notified: Optional[bool] = None,
+                 attempt_token: Optional[str] = None):
+    """Record completion or persist a bounded retry for an incomplete job."""
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
-            if job["id"] == job_id:
-                now = _hermes_now().isoformat()
-                job["last_run_at"] = now
-                job["last_status"] = "ok" if success else "error"
-                job["last_error"] = error if not success else None
-                # Track delivery failures separately — cleared on successful delivery
-                job["last_delivery_error"] = delivery_error
-                # Clear any external-fire claim so a re-armed recurring job can
-                # be claimed again on its next fire (Phase 4C CAS).
-                job["fire_claim"] = None
-                
-                # Increment completed count
-                if job.get("repeat"):
-                    job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
-                    
-                    # Check if we've hit the repeat limit
-                    times = job["repeat"].get("times")
-                    completed = job["repeat"]["completed"]
-                    if times is not None and times > 0 and completed >= times:
-                        # Remove the job (limit reached)
-                        jobs.pop(i)
-                        save_jobs(jobs)
-                        return
-                
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+            if job["id"] != job_id:
+                continue
 
-                # If no next run, decide whether this is terminal completion
-                # (one-shot) or a transient failure (recurring schedule couldn't
-                # compute — e.g. 'croniter' missing from the runtime env).
-                # Recurring jobs must NEVER be silently disabled: that turns a
-                # missing runtime dep into "job completed" and the user's
-                # schedule quietly goes off. See issue #16265.
-                if job["next_run_at"] is None:
-                    kind = job.get("schedule", {}).get("kind")
-                    if kind in {"cron", "interval"}:
-                        job["state"] = "error"
-                        if not job.get("last_error"):
-                            job["last_error"] = (
-                                "Failed to compute next run for recurring "
-                                "schedule (is the 'croniter' package "
-                                "installed in the gateway's Python env?)"
-                            )
-                        logger.error(
-                            "Job '%s' (%s) could not compute next_run_at; "
-                            "leaving enabled and marking state=error so the "
-                            "job is not silently disabled.",
-                            job.get("name", job["id"]),
-                            kind,
-                        )
-                    else:
-                        job["enabled"] = False
-                        job["state"] = "completed"
-                elif job.get("state") != "paused":
+            current_token = job.get("attempt_token") or job.get("attempt_started_at")
+            if attempt_token and current_token != attempt_token:
+                logger.warning(
+                    "Ignoring stale completion for job %s (attempt ownership changed)",
+                    job_id,
+                )
+                return
+
+            now_dt = _hermes_now()
+            now = now_dt.isoformat()
+            completed_successfully = bool(success) and not delivery_error
+            normal_next_run = None
+            schedule_error = None
+            if completed_successfully:
+                normal_next_run = compute_next_run(job["schedule"], now)
+                kind = job.get("schedule", {}).get("kind")
+                if normal_next_run is None and kind in {"cron", "interval"}:
+                    completed_successfully = False
+                    schedule_error = (
+                        "Failed to compute next run for recurring schedule "
+                        "(is the 'croniter' package installed in the gateway's "
+                        "Python env?)"
+                    )
+            job["last_run_at"] = now
+            job["last_status"] = "ok" if completed_successfully else "error"
+            job["last_delivery_error"] = delivery_error
+            job["fire_claim"] = None
+            job["attempt_started_at"] = None
+            job["attempt_lease_expires_at"] = None
+            job["attempt_scheduled_for"] = None
+            job["attempt_token"] = None
+
+            if completed_successfully:
+                job["last_error"] = None
+                job["last_success_at"] = now
+                job["consecutive_failures"] = 0
+                job["retry_scheduled_for"] = None
+                job["last_failure_signature"] = None
+                job["last_failure_notified_at"] = None
+            else:
+                failure_reason = error or schedule_error
+                if not failure_reason and delivery_error:
+                    failure_reason = f"Delivery incomplete: {delivery_error}"
+                job["last_error"] = failure_reason or "Job objective did not complete"
+                previous_signature = job.get("last_failure_signature")
+                current_signature = failure_signature(job["last_error"])
+                job["last_failure_signature"] = current_signature
+                if failure_notified:
+                    job["last_failure_notified_at"] = now
+                elif current_signature != previous_signature:
+                    job["last_failure_notified_at"] = None
+                job["last_failure_at"] = now
+                try:
+                    prior_failures = max(0, int(job.get("consecutive_failures") or 0))
+                except (TypeError, ValueError):
+                    prior_failures = 0
+                job["consecutive_failures"] = prior_failures + 1
+
+            # Failed attempts never consume a finite job's completion budget.
+            # A one-shot remains live until it actually succeeds.
+            if completed_successfully and job.get("repeat"):
+                job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
+                times = job["repeat"].get("times")
+                completed = job["repeat"]["completed"]
+                if times is not None and times > 0 and completed >= times:
+                    jobs.pop(i)
+                    save_jobs(jobs)
+                    return
+
+            if not completed_successfully:
+                retry_at = _failure_retry_at(
+                    job,
+                    now_dt,
+                    job["consecutive_failures"],
+                    delivery_failed=bool(delivery_error),
+                )
+                job["next_run_at"] = retry_at
+                job["retry_scheduled_for"] = retry_at
+                if job.get("state") != "paused":
                     job["state"] = "scheduled"
-
                 save_jobs(jobs)
                 return
+
+            # A verified success returns to the normal recurring cadence.
+            job["next_run_at"] = normal_next_run
+
+            # Recurring schedule failures returned through the retry branch
+            # above, so no next run here is a verified one-shot completion.
+            if job["next_run_at"] is None:
+                job["enabled"] = False
+                job["state"] = "completed"
+            elif job.get("state") != "paused":
+                job["state"] = "scheduled"
+
+            save_jobs(jobs)
+            return
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
 
 
-def advance_next_run(job_id: str) -> bool:
-    """Preemptively advance next_run_at for a recurring job before execution.
+def advance_next_run(job_id: str, *, attempt_token: Optional[str] = None) -> bool:
+    """Lease an attempt and preemptively advance a recurring schedule.
 
-    Call this BEFORE run_job() so that if the process crashes mid-execution,
-    the job won't re-fire on the next gateway restart.  This converts the
-    scheduler from at-least-once to at-most-once for recurring jobs — missing
-    one run is far better than firing dozens of times in a crash loop.
-
-    One-shot jobs are left unchanged so they can still retry on restart.
-
-    Returns True if next_run_at was advanced, False otherwise.
+    The lease prevents duplicate concurrent execution. If the process dies
+    before ``mark_job_run`` clears it, ``get_due_jobs`` recovers the objective
+    after the bounded lease instead of silently losing that run.
     """
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
             if job["id"] == job_id:
+                now_dt = _hermes_now()
+                now = now_dt.isoformat()
+                token = attempt_token or uuid.uuid4().hex
+                job["attempt_started_at"] = now
+                job["attempt_lease_expires_at"] = (
+                    now_dt + timedelta(seconds=ATTEMPT_LEASE_SECONDS)
+                ).isoformat()
+                job["attempt_scheduled_for"] = job.get("next_run_at")
+                job["attempt_token"] = token
                 kind = job.get("schedule", {}).get("kind")
                 if kind not in {"cron", "interval"}:
+                    save_jobs(jobs)
                     return False
-                now = _hermes_now().isoformat()
                 new_next = compute_next_run(job["schedule"], now)
+                advanced = bool(new_next and new_next != job.get("next_run_at"))
                 if new_next and new_next != job.get("next_run_at"):
                     job["next_run_at"] = new_next
-                    save_jobs(jobs)
-                    return True
+                save_jobs(jobs)
+                return advanced
+        return False
+
+
+def renew_attempt_lease(
+    job_id: str,
+    attempt_token: str,
+    *,
+    lease_seconds: Optional[float] = None,
+) -> bool:
+    """Extend one live attempt lease without reviving a different attempt.
+
+    The ownership token fences a late heartbeat from an older worker after a
+    retry has already claimed the same job. External fire claims share the
+    heartbeat so their multi-machine deduplication remains valid for the full
+    worker lifetime too.
+    """
+    if not attempt_token:
+        return False
+
+    duration = ATTEMPT_LEASE_SECONDS if lease_seconds is None else lease_seconds
+    if duration <= 0:
+        raise ValueError("lease_seconds must be positive")
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            current_token = job.get("attempt_token") or job.get("attempt_started_at")
+            if not job.get("attempt_started_at") or current_token != attempt_token:
                 return False
+
+            now = _hermes_now()
+            job["attempt_token"] = attempt_token
+            job["attempt_lease_expires_at"] = (
+                now + timedelta(seconds=duration)
+            ).isoformat()
+
+            fire_claim = job.get("fire_claim")
+            if isinstance(fire_claim, dict):
+                claim_token = fire_claim.get("attempt_token")
+                if claim_token in {None, attempt_token}:
+                    fire_claim["attempt_token"] = attempt_token
+                    fire_claim["at"] = now.isoformat()
+
+            save_jobs(jobs)
+            return True
         return False
 
 
@@ -1285,7 +1472,11 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
-def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
+def claim_job_for_fire(
+    job_id: str,
+    *,
+    claim_ttl_seconds: int = ATTEMPT_LEASE_SECONDS,
+) -> bool:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
 
@@ -1322,7 +1513,18 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
-            job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
+            attempt_token = uuid.uuid4().hex
+            job["fire_claim"] = {
+                "at": now.isoformat(),
+                "by": _machine_id(),
+                "attempt_token": attempt_token,
+            }
+            job["attempt_started_at"] = now.isoformat()
+            job["attempt_lease_expires_at"] = (
+                now + timedelta(seconds=ATTEMPT_LEASE_SECONDS)
+            ).isoformat()
+            job["attempt_scheduled_for"] = job.get("next_run_at")
+            job["attempt_token"] = attempt_token
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
@@ -1344,8 +1546,8 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     still fires ONCE now. This prevents the perpetual-defer loop (#33315) where
     a job whose runtime exceeds ``interval + grace`` would be skipped forever.
 
-    Note: firing once on catch-up flows through ``mark_job_run``, so a job with
-    a ``repeat.times`` limit consumes one of its runs on that catch-up fire.
+    Note: firing once on catch-up flows through ``mark_job_run``; a finite
+    ``repeat.times`` budget advances only if that recovered attempt succeeds.
     """
     with _jobs_lock():
         return _get_due_jobs_locked()
@@ -1362,6 +1564,57 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     for job in jobs:
         if not job.get("enabled", True):
             continue
+
+        attempt_started = job.get("attempt_started_at")
+        if attempt_started:
+            try:
+                lease_expires = _ensure_aware(
+                    datetime.fromisoformat(job["attempt_lease_expires_at"])
+                )
+            except (KeyError, TypeError, ValueError):
+                # Malformed lease state cannot be trusted to suppress work.
+                lease_expires = now
+
+            if lease_expires > now:
+                # Another process/thread still owns a valid execution lease.
+                continue
+
+            recovery_error = (
+                "Previous cron attempt did not record completion before its "
+                "execution lease expired; objective retained for retry"
+            )
+            job["last_status"] = "error"
+            job["last_error"] = recovery_error
+            job["last_failure_at"] = now.isoformat()
+            try:
+                prior_failures = max(0, int(job.get("consecutive_failures") or 0))
+            except (TypeError, ValueError):
+                prior_failures = 0
+            job["consecutive_failures"] = prior_failures + 1
+            job["next_run_at"] = now.isoformat()
+            job["retry_scheduled_for"] = job["next_run_at"]
+            job["attempt_started_at"] = None
+            job["attempt_lease_expires_at"] = None
+            job["attempt_scheduled_for"] = None
+            job["attempt_token"] = None
+            logger.error("Job '%s': %s", job.get("name", job["id"]), recovery_error)
+
+            for raw_job in raw_jobs:
+                if raw_job["id"] == job["id"]:
+                    raw_job.update({
+                        "last_status": job["last_status"],
+                        "last_error": job["last_error"],
+                        "last_failure_at": job["last_failure_at"],
+                        "consecutive_failures": job["consecutive_failures"],
+                        "next_run_at": job["next_run_at"],
+                        "retry_scheduled_for": job["retry_scheduled_for"],
+                        "attempt_started_at": None,
+                        "attempt_lease_expires_at": None,
+                        "attempt_scheduled_for": None,
+                        "attempt_token": None,
+                    })
+                    needs_save = True
+                    break
 
         next_run = job.get("next_run_at")
         if not next_run:
@@ -1496,9 +1749,20 @@ def save_job_output(job_id: str, output: str):
     job_output_dir = _job_output_dir(job_id)
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
-    
-    timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_file = job_output_dir / f"{timestamp}.md"
+
+    # Silent no-op ticks are operational heartbeats, not durable reports.
+    # High-frequency pollers can otherwise create hundreds of thousands of
+    # tiny files per year. Preserve the latest heartbeat while keeping every
+    # substantive/error output timestamped for audit history.
+    silent_status = re.search(
+        r"(?m)^\*\*Status:\*\* silent \((?:wakeAgent=false|empty output)\)\s*$",
+        output,
+    )
+    if silent_status:
+        output_file = job_output_dir / "latest-silent.md"
+    else:
+        timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
+        output_file = job_output_dir / f"{timestamp}.md"
     
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
     try:

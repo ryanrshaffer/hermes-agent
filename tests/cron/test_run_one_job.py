@@ -10,6 +10,9 @@ The first test characterizes the sequence as driven through `tick()` (proving
 the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
+import threading
+import time
+
 import cron.scheduler as s
 
 
@@ -31,7 +34,14 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("deliver", job["id"]))
         return None
 
-    def fake_mark(jid, ok, err=None, delivery_error=None):
+    def fake_mark(
+        jid,
+        ok,
+        err=None,
+        delivery_error=None,
+        failure_notified=None,
+        attempt_token=None,
+    ):
         calls.append(("mark", jid, ok))
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
@@ -46,7 +56,7 @@ def test_tick_process_job_sequence(monkeypatch):
     sequence run_job → save → deliver → mark, in that order."""
     calls = _patch_pipeline(monkeypatch)
     monkeypatch.setattr(s, "get_due_jobs", lambda: [{"id": "j1", "name": "t"}])
-    monkeypatch.setattr(s, "advance_next_run", lambda jid: True)
+    monkeypatch.setattr(s, "advance_next_run", lambda jid, **_kw: True)
 
     s.tick(verbose=False, sync=True)
 
@@ -117,3 +127,42 @@ def test_run_one_job_exception_marks_failure(monkeypatch):
 
     assert ok is False
     assert marks == [("j6", False)]
+
+
+def test_run_one_job_renews_lease_for_full_worker_lifetime(monkeypatch):
+    """A worker heartbeat runs until completion, then stops immediately."""
+    release_worker = threading.Event()
+    first_renewal = threading.Event()
+    renewal_calls = []
+
+    def blocking_run(job):
+        assert release_worker.wait(timeout=2)
+        return True, "out", "final", None
+
+    def renew(job_id, attempt_token):
+        renewal_calls.append((job_id, attempt_token))
+        first_renewal.set()
+        return True
+
+    monkeypatch.setattr(s, "ATTEMPT_LEASE_RENEW_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(s, "renew_attempt_lease", renew)
+    monkeypatch.setattr(s, "run_job", blocking_run)
+    monkeypatch.setattr(s, "save_job_output", lambda *_a, **_kw: "/tmp/out")
+    monkeypatch.setattr(s, "_deliver_result", lambda *_a, **_kw: None)
+    monkeypatch.setattr(s, "mark_job_run", lambda *_a, **_kw: None)
+
+    worker = threading.Thread(
+        target=s.run_one_job,
+        args=({"id": "long-job", "name": "long", "attempt_token": "owner"},),
+    )
+    worker.start()
+    assert first_renewal.wait(timeout=1)
+    assert renewal_calls[0] == ("long-job", "owner")
+
+    release_worker.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+
+    calls_after_completion = len(renewal_calls)
+    time.sleep(0.05)
+    assert len(renewal_calls) == calls_after_completion

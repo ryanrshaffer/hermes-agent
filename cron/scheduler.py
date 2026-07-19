@@ -20,6 +20,8 @@ import shutil
 import subprocess
 import sys
 import threading
+import uuid
+from datetime import datetime
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -236,12 +238,22 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import (
+    ATTEMPT_LEASE_SECONDS,
+    FAILURE_REMINDER_SECONDS,
+    advance_next_run,
+    failure_signature,
+    get_due_jobs,
+    mark_job_run,
+    renew_attempt_lease,
+    save_job_output,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+RETRY_MARKER = "[RETRY]"
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -252,6 +264,7 @@ _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
+ATTEMPT_LEASE_RENEW_INTERVAL_SECONDS = max(1.0, ATTEMPT_LEASE_SECONDS / 3)
 
 # Sequential (env-mutating) cron jobs — workdir jobs that touch
 # process-global runtime state — must run one at a time, but must NOT block the
@@ -301,6 +314,49 @@ def _shutdown_parallel_pool() -> None:
     if _sequential_pool is not None:
         _sequential_pool.shutdown(wait=True, cancel_futures=False)
         _sequential_pool = None
+
+
+def _start_attempt_lease_renewer(
+    job: dict,
+) -> Optional[tuple[threading.Event, threading.Thread]]:
+    """Keep a claimed attempt alive until its queued/running future ends."""
+    attempt_token = job.get("attempt_token")
+    if not attempt_token:
+        return None
+
+    stop_event = threading.Event()
+
+    def _renew() -> None:
+        while not stop_event.wait(ATTEMPT_LEASE_RENEW_INTERVAL_SECONDS):
+            try:
+                if not renew_attempt_lease(job["id"], attempt_token):
+                    return
+            except Exception as exc:
+                # A transient store write failure must not kill future renewal
+                # attempts while the worker is still alive.
+                logger.warning(
+                    "Job '%s': failed to renew execution lease: %s",
+                    job.get("name", job["id"]),
+                    exc,
+                )
+
+    thread = threading.Thread(
+        target=_renew,
+        name=f"cron-lease-{job['id'][:24]}",
+        daemon=True,
+    )
+    thread.start()
+    return stop_event, thread
+
+
+def _stop_attempt_lease_renewer(
+    renewer: Optional[tuple[threading.Event, threading.Thread]],
+) -> None:
+    if renewer is None:
+        return
+    stop_event, thread = renewer
+    stop_event.set()
+    thread.join(timeout=1.0)
 
 
 atexit.register(_shutdown_parallel_pool)
@@ -802,13 +858,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
+    # in config.yaml for clean output.  Individual jobs may opt out with
+    # ``wrap_response: false`` in their job record for concise direct reports.
     wrap_response = True
-    try:
-        user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
-    except Exception:
-        pass
+    if "wrap_response" in job:
+        wrap_response = bool(job.get("wrap_response"))
+    else:
+        try:
+            user_cfg = load_config()
+            wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+        except Exception:
+            pass
 
     if wrap_response:
         task_name = job.get("name", job["id"])
@@ -1173,7 +1233,11 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(
+    script_path: str,
+    *,
+    workdir: Optional[str] = None,
+) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -1199,6 +1263,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        workdir: Optional existing directory to use as the subprocess cwd.
+            The script path remains restricted to HERMES_HOME/scripts/.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -1229,6 +1295,15 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
+    execution_cwd = path.parent
+    if workdir:
+        workdir_path = Path(workdir).expanduser()
+        if not workdir_path.is_absolute():
+            return False, f"Cron job workdir must be absolute: {workdir!r}"
+        if not workdir_path.is_dir():
+            return False, f"Cron job workdir does not exist or is not a directory: {workdir_path}"
+        execution_cwd = workdir_path.resolve()
+
     script_timeout = _get_script_timeout()
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
@@ -1242,9 +1317,14 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         # shutil.which returns None — fall back to a clear error rather
         # than a FileNotFoundError with a confusing "[WinError 2]"
         # traceback.
-        _bash = shutil.which("bash") or (
-            "/bin/bash" if os.path.isfile("/bin/bash") else None
-        )
+        _bash = shutil.which("bash")
+        if _bash is None:
+            try:
+                from tools.environments.local import _find_bash
+
+                _bash = _find_bash()
+            except RuntimeError:
+                _bash = None
         if _bash is None:
             return False, (
                 f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
@@ -1264,7 +1344,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=script_timeout,
-            cwd=str(path.parent),
+            cwd=str(execution_cwd),
             env=_sanitize_subprocess_env(os.environ.copy()),
             **popen_kwargs,
         )
@@ -1430,7 +1510,13 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "SILENT: If there is genuinely nothing new to report, respond "
         "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
         "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
+        "findings normally, or say [SILENT] and nothing more. "
+        "COMPLETION: Never claim success while required inputs or acceptance "
+        "criteria are stale, partial, inconsistent, unavailable, or unverified. "
+        "First attempt safe in-scope remediation. If the objective still is not "
+        "complete, begin the final response with \"[RETRY]\" followed by a "
+        "concise reason. The scheduler will retain the objective and retry it "
+        "with bounded backoff. Never use [SILENT] for incomplete work.]\n\n"
     )
     prompt = cron_hint + prompt
     if skills is None:
@@ -1603,6 +1689,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    _job_workdir = (job.get("workdir") or "").strip() or None
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -1629,26 +1716,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.error("Job '%s': %s", job_id, err)
             return False, "", "", err
 
-        # Apply workdir if configured — lets scripts use predictable relative
-        # paths. For no_agent jobs this is just the subprocess cwd (not an
-        # agent TERMINAL_CWD bridge).
-        _job_workdir = (job.get("workdir") or "").strip() or None
-        _prior_cwd = None
-        if _job_workdir and Path(_job_workdir).is_dir():
-            _prior_cwd = os.getcwd()
-            try:
-                os.chdir(_job_workdir)
-            except OSError:
-                _prior_cwd = None
-
-        try:
-            ok, output = _run_job_script(script_path)
-        finally:
-            if _prior_cwd is not None:
-                try:
-                    os.chdir(_prior_cwd)
-                except OSError:
-                    pass
+        # Pass workdir directly to the child process. A process-wide chdir
+        # would be racy and was ineffective because _run_job_script set its
+        # own cwd to the scripts directory.
+        ok, output = _run_job_script(script_path, workdir=_job_workdir)
 
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1715,6 +1786,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # ---------------------------------------------------------------
     from run_agent import AIAgent
 
+    if _job_workdir and not Path(_job_workdir).is_dir():
+        logger.warning(
+            "Job '%s': configured workdir %r no longer exists; running without it",
+            job_id, _job_workdir,
+        )
+        _job_workdir = None
+
     # Initialize SQLite session store so cron job messages are persisted
     # and discoverable via session_search (same pattern as gateway/run.py).
     _session_db = None
@@ -1731,7 +1809,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_job_script(script_path, workdir=_job_workdir)
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
@@ -1741,8 +1819,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
-                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                "Script gate returned `wakeAgent=false` — agent skipped.\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "**Mode:** agent (script gate)\n"
+                "**Status:** silent (wakeAgent=false)\n"
             )
             return True, silent_doc, SILENT_MARKER, None
 
@@ -1835,15 +1914,6 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # os.environ["TERMINAL_CWD"] here is safe for those jobs.  For workdir-less
     # jobs we leave TERMINAL_CWD untouched — preserves the original behaviour
     # (skip_context_files=True, tools use whatever cwd the scheduler has).
-    _job_workdir = (job.get("workdir") or "").strip() or None
-    if _job_workdir and not Path(_job_workdir).is_dir():
-        # Directory was removed between create-time validation and now.  Log
-        # and drop back to old behaviour rather than crashing the job.
-        logger.warning(
-            "Job '%s': configured workdir %r no longer exists — running without it",
-            job_id, _job_workdir,
-        )
-        _job_workdir = None
     _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
     if _job_workdir:
         os.environ["TERMINAL_CWD"] = _job_workdir
@@ -2235,27 +2305,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # would otherwise be delivered as if it were the agent's reply and the
         # job's `last_status` set to "ok". Raise so the except handler below
         # builds the proper failure tuple. (issue #17855)
-        turn_exit_reason = str(result.get("turn_exit_reason") or "")
         final_response_text = (result.get("final_response") or "").strip()
-        max_iteration_summary = (
-            result.get("failed") is not True
-            and result.get("completed") is False
-            and turn_exit_reason.startswith("max_iterations_reached(")
-            and bool(final_response_text)
-        )
-        if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+        if result.get("failed") is True or result.get("completed") is False:
             _err_text = (
                 result.get("error")
                 or final_response_text
                 or "agent reported failure"
             )
             raise RuntimeError(_err_text)
-        if max_iteration_summary:
-            logger.warning(
-                "Job '%s' reached the iteration limit but produced a final fallback response; "
-                "delivering the response instead of failing the cron run",
-                job_name,
-            )
 
         final_response = result.get("final_response", "") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.
@@ -2264,6 +2321,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
+        retry_requested = final_response.strip().upper().startswith(RETRY_MARKER)
         
         output = f"""# Cron Job: {job_name}
 
@@ -2279,6 +2337,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
 {logged_response}
 """
+
+        if retry_requested:
+            retry_reason = final_response.strip()[len(RETRY_MARKER):].strip(" :-\n")
+            retry_reason = retry_reason or "agent reported incomplete acceptance criteria"
+            logger.warning(
+                "Job '%s' requested a persistent retry: %s",
+                job_name,
+                retry_reason,
+            )
+            return False, output, "", f"Objective incomplete: {retry_reason}"
         
         logger.info("Job '%s' completed successfully", job_name)
         return True, output, final_response, None
@@ -2359,7 +2427,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def run_one_job(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    _lease_managed: bool = False,
+) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -2374,6 +2449,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    lease_renewer = None if _lease_managed else _start_attempt_lease_renewer(job)
+    attempt_mark_kwargs = (
+        {"attempt_token": job["attempt_token"]}
+        if job.get("attempt_token")
+        else {}
+    )
     try:
         success, output, final_response, error = run_job(job)
 
@@ -2393,10 +2474,36 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
             should_deliver = False
 
+        # Persistent retries must not become persistent notification spam.
+        # Deliver the first occurrence, any materially different failure, and
+        # one unchanged reminder per day; every attempt remains in local output.
+        if should_deliver and not success:
+            current_signature = failure_signature(error)
+            previous_signature = job.get("last_failure_signature")
+            reminder_due = True
+            if current_signature == previous_signature:
+                try:
+                    last_notice = datetime.fromisoformat(
+                        job["last_failure_notified_at"]
+                    )
+                    reminder_due = (
+                        _hermes_now() - last_notice
+                    ).total_seconds() >= FAILURE_REMINDER_SECONDS
+                except (KeyError, TypeError, ValueError):
+                    reminder_due = True
+            if current_signature == previous_signature and not reminder_due:
+                logger.info(
+                    "Job '%s': unchanged failure already reported; suppressing repeat delivery",
+                    job["id"],
+                )
+                should_deliver = False
+
         delivery_error = None
+        failure_notified = False
         if should_deliver:
             try:
                 delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                failure_notified = not success and delivery_error is None
             except Exception as de:
                 delivery_error = str(de)
                 logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -2408,13 +2515,27 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        mark_job_run(
+            job["id"],
+            success,
+            error,
+            delivery_error=delivery_error,
+            failure_notified=failure_notified if not success else None,
+            **attempt_mark_kwargs,
+        )
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
-        mark_job_run(job["id"], False, str(e))
+        mark_job_run(
+            job["id"],
+            False,
+            str(e),
+            **attempt_mark_kwargs,
+        )
         return False
+    finally:
+        _stop_attempt_lease_renewer(lease_renewer)
 
 
 def _notify_provider_jobs_changed() -> None:
@@ -2477,13 +2598,25 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, advance_next_run keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
+        # Lease each attempt and advance recurring next_run_at FIRST, under the
+        # file lock. Fresh leases prevent duplicate execution; an expired lease
+        # is recovered by get_due_jobs after a process crash. mark_job_run()
+        # clears the lease and writes either normal cadence or bounded retry.
+        leased_jobs = []
         for job in due_jobs:
-            advance_next_run(job["id"])
+            with _running_lock:
+                already_running = job["id"] in _running_job_ids
+            if already_running:
+                logger.info(
+                    "Job '%s' already running — skipping",
+                    job.get("name", job["id"]),
+                )
+                continue
+            attempt_token = uuid.uuid4().hex
+            advance_next_run(job["id"], attempt_token=attempt_token)
+            job["attempt_token"] = attempt_token
+            leased_jobs.append(job)
+        due_jobs = leased_jobs
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
@@ -2517,14 +2650,22 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             module-level ``run_one_job`` so ``tick`` and external providers
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
             body."""
-            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            return run_one_job(
+                job,
+                adapters=adapters,
+                loop=loop,
+                verbose=verbose,
+                _lease_managed=True,
+            )
 
-        # Partition due jobs: those with a per-job workdir mutate
-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global —
-        # so they MUST run sequentially to avoid corrupting each other.  Jobs
-        # without a workdir leave env untouched and stay parallel-safe.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        # Agent jobs with a per-job workdir mutate process-global TERMINAL_CWD,
+        # so they MUST run sequentially. no_agent scripts pass cwd directly to
+        # subprocess.run and remain parallel-safe.
+        sequential_jobs = [
+            j for j in due_jobs
+            if (j.get("workdir") or "").strip() and not j.get("no_agent")
+        ]
+        parallel_jobs = [j for j in due_jobs if j not in sequential_jobs]
 
         _results: list = []
         _all_futures: list = []
@@ -2543,15 +2684,23 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     return None
                 _running_job_ids.add(job_id)
             _ctx = contextvars.copy_context()
+            lease_renewer = _start_attempt_lease_renewer(job)
 
             def _run_and_release(j=job, ctx=_ctx):
                 try:
                     return ctx.run(_process_job, j)
                 finally:
+                    _stop_attempt_lease_renewer(lease_renewer)
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
 
-            return pool.submit(_run_and_release)
+            try:
+                return pool.submit(_run_and_release)
+            except Exception:
+                _stop_attempt_lease_renewer(lease_renewer)
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                raise
 
         # Sequential pass for env-mutating (workdir) jobs.
         # Queued to a persistent single-thread pool so they run one at a time

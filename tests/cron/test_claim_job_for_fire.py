@@ -7,6 +7,8 @@ claim for a given fire. Single-machine deployments always win (unaffected).
 These exercise the real store against a temp HERMES_HOME (no mocks) per the
 E2E-over-mocks discipline for file-touching code.
 """
+from datetime import datetime, timedelta
+
 import pytest
 
 
@@ -14,7 +16,18 @@ import pytest
 def temp_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME so jobs.json doesn't touch the real store."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    # cron.jobs caches no home at import; get_hermes_home() reads the env live.
+    # cron.jobs resolves its storage constants at import. In a combined test
+    # process another module may already have imported it before this fixture
+    # changes HERMES_HOME, so patch every cached path as well as the env.
+    import cron.jobs as jobs
+
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs, "HERMES_DIR", tmp_path)
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+    monkeypatch.setattr(jobs, "TICKER_HEARTBEAT_FILE", cron_dir / "ticker_heartbeat")
+    monkeypatch.setattr(jobs, "TICKER_SUCCESS_FILE", cron_dir / "ticker_last_success")
     yield tmp_path
 
 
@@ -82,3 +95,36 @@ def test_mark_job_run_clears_claim(temp_home):
     assert get_job(jid).get("fire_claim") is None
     # …and the re-armed recurring job is claimable again.
     assert claim_job_for_fire(jid) is True
+
+
+def test_live_external_claim_renews_past_original_ttl(temp_home, monkeypatch):
+    """A multi-hour external fire stays claimed while its worker is alive."""
+    import cron.jobs as jobs_module
+    from cron.jobs import (
+        claim_job_for_fire,
+        create_job,
+        get_job,
+        renew_attempt_lease,
+    )
+
+    start = datetime.now().astimezone().replace(microsecond=0)
+    monkeypatch.setattr(jobs_module, "_hermes_now", lambda: start)
+    job = create_job(prompt="x", schedule="every 5m", name="renewed")
+    assert claim_job_for_fire(job["id"]) is True
+    token = get_job(job["id"])["attempt_token"]
+
+    monkeypatch.setattr(
+        jobs_module,
+        "_hermes_now",
+        lambda: start + timedelta(minutes=20),
+    )
+    assert renew_attempt_lease(job["id"], token) is True
+
+    # Thirty-five minutes elapsed since the original claim, but only fifteen
+    # since its active worker heartbeat, so another replica must still lose.
+    monkeypatch.setattr(
+        jobs_module,
+        "_hermes_now",
+        lambda: start + timedelta(minutes=35),
+    )
+    assert claim_job_for_fire(job["id"]) is False

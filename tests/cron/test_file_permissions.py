@@ -8,6 +8,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 
+def _assert_secure_mode(test_case, path, expected_mode, chmod_spy):
+    """Assert the supported permission contract on this platform."""
+    if os.name == "nt":
+        chmod_spy.assert_any_call(path, expected_mode)
+        return
+    actual_mode = stat.S_IMODE(os.stat(path).st_mode)
+    test_case.assertEqual(actual_mode, expected_mode)
+
+
 class TestCronFilePermissions(unittest.TestCase):
     """Verify cron files get secure permissions."""
 
@@ -30,14 +39,13 @@ class TestCronFilePermissions(unittest.TestCase):
         output_dir = cron_dir / "output"
 
         with patch("cron.jobs.CRON_DIR", cron_dir), \
-             patch("cron.jobs.OUTPUT_DIR", output_dir):
+             patch("cron.jobs.OUTPUT_DIR", output_dir), \
+             patch("os.chmod", wraps=os.chmod) as chmod_spy:
             from cron.jobs import ensure_dirs
             ensure_dirs()
 
-            cron_mode = stat.S_IMODE(os.stat(cron_dir).st_mode)
-            output_mode = stat.S_IMODE(os.stat(output_dir).st_mode)
-            self.assertEqual(cron_mode, 0o700)
-            self.assertEqual(output_mode, 0o700)
+            _assert_secure_mode(self, cron_dir, 0o700, chmod_spy)
+            _assert_secure_mode(self, output_dir, 0o700, chmod_spy)
 
     @patch("cron.jobs.CRON_DIR")
     @patch("cron.jobs.OUTPUT_DIR")
@@ -49,29 +57,28 @@ class TestCronFilePermissions(unittest.TestCase):
 
         with patch("cron.jobs.CRON_DIR", cron_dir), \
              patch("cron.jobs.OUTPUT_DIR", output_dir), \
-             patch("cron.jobs.JOBS_FILE", jobs_file):
+             patch("cron.jobs.JOBS_FILE", jobs_file), \
+             patch("os.chmod", wraps=os.chmod) as chmod_spy:
             from cron.jobs import save_jobs
             save_jobs([{"id": "test", "prompt": "hello"}])
 
-            file_mode = stat.S_IMODE(os.stat(jobs_file).st_mode)
-            self.assertEqual(file_mode, 0o600)
+            _assert_secure_mode(self, jobs_file, 0o600, chmod_spy)
 
     def test_save_job_output_sets_0600(self):
         output_dir = Path(self.tmpdir) / "output"
         with patch("cron.jobs.OUTPUT_DIR", output_dir), \
              patch("cron.jobs.CRON_DIR", Path(self.tmpdir)), \
-             patch("cron.jobs.ensure_dirs"):
+             patch("cron.jobs.ensure_dirs"), \
+             patch("os.chmod", wraps=os.chmod) as chmod_spy:
             output_dir.mkdir(parents=True, exist_ok=True)
             from cron.jobs import save_job_output
             output_file = save_job_output("test-job", "test output content")
 
-            file_mode = stat.S_IMODE(os.stat(output_file).st_mode)
-            self.assertEqual(file_mode, 0o600)
+            _assert_secure_mode(self, output_file, 0o600, chmod_spy)
 
             # Job output dir should also be 0700
             job_dir = output_dir / "test-job"
-            dir_mode = stat.S_IMODE(os.stat(job_dir).st_mode)
-            self.assertEqual(dir_mode, 0o700)
+            _assert_secure_mode(self, job_dir, 0o700, chmod_spy)
 
 
 class TestConfigFilePermissions(unittest.TestCase):
@@ -87,35 +94,34 @@ class TestConfigFilePermissions(unittest.TestCase):
     def test_save_config_sets_0600(self):
         config_path = Path(self.tmpdir) / "config.yaml"
         with patch("hermes_cli.config.get_config_path", return_value=config_path), \
-             patch("hermes_cli.config.ensure_hermes_home"):
+             patch("hermes_cli.config.ensure_hermes_home"), \
+             patch("os.chmod", wraps=os.chmod) as chmod_spy:
             from hermes_cli.config import save_config
             save_config({"model": "test/model"})
 
-            file_mode = stat.S_IMODE(os.stat(config_path).st_mode)
-            self.assertEqual(file_mode, 0o600)
+            _assert_secure_mode(self, config_path, 0o600, chmod_spy)
 
     def test_save_env_value_sets_0600(self):
         env_path = Path(self.tmpdir) / ".env"
         with patch("hermes_cli.config.get_env_path", return_value=env_path), \
-             patch("hermes_cli.config.ensure_hermes_home"):
+             patch("hermes_cli.config.ensure_hermes_home"), \
+             patch("os.chmod", wraps=os.chmod) as chmod_spy:
             from hermes_cli.config import save_env_value
             save_env_value("TEST_KEY", "test_value")
 
-            file_mode = stat.S_IMODE(os.stat(env_path).st_mode)
-            self.assertEqual(file_mode, 0o600)
+            _assert_secure_mode(self, env_path, 0o600, chmod_spy)
 
     def test_ensure_hermes_home_sets_0700(self):
         home = Path(self.tmpdir) / ".hermes"
-        with patch("hermes_cli.config.get_hermes_home", return_value=home):
+        with patch("hermes_cli.config.get_hermes_home", return_value=home), \
+             patch("os.chmod", wraps=os.chmod) as chmod_spy:
             from hermes_cli.config import ensure_hermes_home
             ensure_hermes_home()
 
-            home_mode = stat.S_IMODE(os.stat(home).st_mode)
-            self.assertEqual(home_mode, 0o700)
+            _assert_secure_mode(self, home, 0o700, chmod_spy)
 
             for subdir in ("cron", "sessions", "logs", "memories"):
-                subdir_mode = stat.S_IMODE(os.stat(home / subdir).st_mode)
-                self.assertEqual(subdir_mode, 0o700, f"{subdir} should be 0700")
+                _assert_secure_mode(self, home / subdir, 0o700, chmod_spy)
 
 
 class TestSecureHelpers(unittest.TestCase):

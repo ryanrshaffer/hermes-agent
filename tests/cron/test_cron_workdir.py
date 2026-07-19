@@ -48,6 +48,7 @@ class TestNormalizeWorkdir:
     def test_tilde_expands(self, tmp_path, monkeypatch):
         from cron.jobs import _normalize_workdir
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         result = _normalize_workdir("~")
         assert result == str(tmp_path.resolve())
 
@@ -250,6 +251,32 @@ class TestTickWorkdirPartition:
             assert workdir_thread_name.startswith("cron-seq"), workdir_thread_name
         par_thread_name = next(t for j, t in calls if j == "c")
         assert par_thread_name.startswith("cron-parallel"), par_thread_name
+
+    def test_no_agent_workdir_job_remains_parallel_safe(self, tmp_path, monkeypatch):
+        import threading
+        import cron.scheduler as sched
+
+        job = {
+            "id": "script-job",
+            "name": "Script job",
+            "workdir": str(tmp_path),
+            "no_agent": True,
+        }
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
+        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        observed = {}
+
+        def fake_run_job(_job):
+            observed["thread"] = threading.current_thread().name
+            return True, "output", "response", None
+
+        monkeypatch.setattr(sched, "run_job", fake_run_job)
+        monkeypatch.setattr(sched, "save_job_output", lambda _jid, _o: None)
+        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
+
+        assert sched.tick(verbose=False) == 1
+        assert observed["thread"].startswith("cron-parallel")
 
 
 # ---------------------------------------------------------------------------

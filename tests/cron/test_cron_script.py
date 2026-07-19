@@ -109,6 +109,37 @@ class TestRunJobScript:
         assert success is True
         assert output == "relative works"
 
+    def test_script_uses_explicit_workdir(self, cron_env, tmp_path):
+        from cron.scheduler import _run_job_script
+
+        workdir = tmp_path / "project"
+        workdir.mkdir()
+        marker = workdir / "marker.txt"
+        marker.write_text("from configured workdir", encoding="utf-8")
+        script = cron_env / "scripts" / "read_marker.py"
+        script.write_text(
+            'from pathlib import Path\nprint(Path("marker.txt").read_text())\n',
+            encoding="utf-8",
+        )
+
+        success, output = _run_job_script(str(script), workdir=str(workdir))
+
+        assert success is True
+        assert output == "from configured workdir"
+
+    def test_script_rejects_missing_explicit_workdir(self, cron_env, tmp_path):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "test.py"
+        script.write_text('print("must not run")\n', encoding="utf-8")
+
+        success, output = _run_job_script(
+            str(script), workdir=str(tmp_path / "missing")
+        )
+
+        assert success is False
+        assert "workdir does not exist" in output
+
     def test_script_not_found(self, cron_env):
         from cron.scheduler import _run_job_script
 
