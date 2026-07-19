@@ -13,6 +13,8 @@ lock. This test proves the lock actually excludes a *separate process*, which an
 in-process ``threading.Lock`` cannot do.
 """
 
+import errno
+import logging
 import os
 import subprocess
 import sys
@@ -26,6 +28,46 @@ from cron import jobs
 
 # Repo root (parent of the ``cron`` package) so the child process can import it.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(jobs.__file__)))
+
+
+@pytest.mark.skipif(jobs.msvcrt is None, reason="Windows msvcrt locking required")
+def test_windows_jobs_lock_retries_contention_before_entering(
+    tmp_path, monkeypatch, caplog
+):
+    """A transient Windows lock collision must not fail open after one call."""
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+    monkeypatch.setattr(jobs, "fcntl", None)
+    monkeypatch.setattr(
+        jobs, "_WINDOWS_JOBS_LOCK_TIMEOUT_SECONDS", 1.0, raising=False
+    )
+
+    calls = []
+    sleeps = []
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_NBLCK = 2
+        LK_UNLCK = 3
+
+        def locking(self, _fd, mode, _length):
+            calls.append(mode)
+            if mode in {self.LK_LOCK, self.LK_NBLCK} and calls.count(mode) < 3:
+                raise OSError(errno.EACCES, "lock held")
+
+    fake_msvcrt = FakeMsvcrt()
+    monkeypatch.setattr(jobs, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(jobs.time, "sleep", sleeps.append)
+
+    with caplog.at_level(logging.WARNING):
+        with jobs._jobs_lock():
+            assert calls == [fake_msvcrt.LK_NBLCK] * 3
+
+    assert calls[-1] == fake_msvcrt.LK_UNLCK
+    assert sleeps == [0.1, 0.1]
+    assert "cross-process lock unavailable" not in caplog.text
 
 
 @pytest.mark.skipif(jobs.fcntl is None, reason="POSIX fcntl/flock required")

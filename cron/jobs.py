@@ -86,6 +86,10 @@ FAILURE_REMINDER_SECONDS = 24 * 60 * 60
 # concurrent mark_job_run / advance_next_run calls can clobber each other.
 _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
+# ``msvcrt.LK_LOCK`` retries only ten times before raising EDEADLK.  Poll the
+# non-blocking variant against our own longer deadline so ordinary contention
+# cannot silently drop Windows writers into unsafe process-local-only mode.
+_WINDOWS_JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
@@ -135,7 +139,19 @@ def _jobs_lock():
                 if fcntl is not None:
                     fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 elif msvcrt is not None:
-                    getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+                    deadline = (
+                        time.monotonic() + _WINDOWS_JOBS_LOCK_TIMEOUT_SECONDS
+                    )
+                    while True:
+                        try:
+                            getattr(msvcrt, "locking")(
+                                lock_fd.fileno(), getattr(msvcrt, "LK_NBLCK"), 1
+                            )
+                            break
+                        except (OSError, IOError):
+                            if time.monotonic() >= deadline:
+                                raise
+                            time.sleep(0.1)
             except (OSError, IOError) as e:
                 # Never let a locking failure take down cron writes — fall back to
                 # in-process-only protection (still held via _jobs_file_lock).
