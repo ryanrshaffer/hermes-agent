@@ -150,6 +150,24 @@ class TestStartupPlatformIsolation:
         with pytest.raises(TimeoutError, match="telegram connect timed out"):
             await runner._connect_adapter_with_timeout(adapter, Platform.TELEGRAM)
 
+    def test_adapter_connect_timeout_is_used_without_global_override(self, monkeypatch):
+        """A slow adapter can request headroom without delaying its peers."""
+        runner = _make_runner()
+        adapter = StubAdapter()
+        adapter.connect_timeout_seconds = 90.0
+        monkeypatch.delenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", raising=False)
+
+        assert runner._platform_connect_timeout_secs(adapter) == 90.0
+
+    def test_global_connect_timeout_overrides_adapter_budget(self, monkeypatch):
+        """The existing operator override remains authoritative."""
+        runner = _make_runner()
+        adapter = StubAdapter()
+        adapter.connect_timeout_seconds = 90.0
+        monkeypatch.setenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "12")
+
+        assert runner._platform_connect_timeout_secs(adapter) == 12.0
+
 
 class TestStartupFailureQueuing:
     """Verify that failed platforms are queued during startup."""

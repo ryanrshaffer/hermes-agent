@@ -72,6 +72,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SIDECAR_PORT = 8789
 _DEFAULT_SIDECAR_BIND = "127.0.0.1"
+_SIDECAR_STARTUP_TIMEOUT_SECONDS = 60.0
 
 # Photon iMessage messages from the SDK side have no documented hard
 # limit, but the underlying iMessage protocol limits practical message
@@ -272,6 +273,7 @@ class PhotonAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = _MAX_MESSAGE_LENGTH
+    connect_timeout_seconds = 90.0
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("photon"))
@@ -434,14 +436,16 @@ class PhotonAdapter(BasePlatformAdapter):
         if self._autostart_sidecar:
             try:
                 await self._start_sidecar()
+            except asyncio.CancelledError:
+                await asyncio.shield(self._cleanup_failed_sidecar_start(client))
+                raise
             except Exception as e:
                 self._set_fatal_error(
                     "SIDECAR_FAILED",
                     f"failed to start Photon sidecar: {e}",
                     retryable=True,
                 )
-                await client.aclose()
-                self._http_client = None
+                await self._cleanup_failed_sidecar_start(client)
                 return False
         else:
             logger.warning(
@@ -464,13 +468,33 @@ class PhotonAdapter(BasePlatformAdapter):
         )
         return True
 
+    async def _cleanup_failed_sidecar_start(
+        self,
+        client: "httpx.AsyncClient",
+    ) -> None:
+        """Release every resource acquired by an incomplete sidecar start."""
+        try:
+            await self._stop_sidecar()
+        except Exception as exc:
+            logger.warning(
+                "[photon] failed to stop sidecar after startup failure: %s", exc
+            )
+        try:
+            await client.aclose()
+        except Exception as exc:
+            logger.warning(
+                "[photon] failed to close HTTP client after startup failure: %s", exc
+            )
+        if self._http_client is client:
+            self._http_client = None
+
     async def disconnect(self) -> None:
         self._inbound_running = False
         if self._sidecar_health_task is not None:
             task = self._sidecar_health_task
             self._sidecar_health_task = None
-            task.cancel()
             if task is not asyncio.current_task():
+                task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
@@ -549,7 +573,7 @@ class PhotonAdapter(BasePlatformAdapter):
             if not self._inbound_running:
                 break
             try:
-                data = await self._sidecar_call("/healthz", {})
+                data = await self._sidecar_health_call()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -562,6 +586,13 @@ class PhotonAdapter(BasePlatformAdapter):
 
             state = str(stream.get("state") or "unknown")
             degraded_for_ms = stream.get("degradedForMs")
+            restart_after_ms = stream.get("restartAfterMs")
+            if (
+                isinstance(degraded_for_ms, (int, float))
+                and isinstance(restart_after_ms, (int, float))
+                and degraded_for_ms < restart_after_ms
+            ):
+                continue
             last_issue = str(stream.get("lastIssue") or "unknown stream issue")
             message = (
                 "Photon upstream stream degraded"
@@ -945,7 +976,8 @@ class PhotonAdapter(BasePlatformAdapter):
         env["PHOTON_SIDECAR_WATCH_STDIN"] = "1"
 
         try:
-            patch = subprocess.run(  # noqa: S603
+            patch = await asyncio.to_thread(
+                subprocess.run,  # noqa: S603
                 [
                     self._node_bin,
                     str(_SIDECAR_DIR / "patch-spectrum-mixed-attachments.mjs"),
@@ -981,11 +1013,14 @@ class PhotonAdapter(BasePlatformAdapter):
             self._supervise_sidecar(self._sidecar_proc)
         )
 
-        # Wait for /healthz to come up — give it up to 15s on cold start.
-        deadline = time.time() + 15.0
+        # Spectrum initializes the cloud provider before opening /healthz.
+        # Cold boots and active system servicing can make that legitimately
+        # slower than the normal 2–11s startup range, so retain a bounded but
+        # resilient readiness window.
+        deadline = time.monotonic() + _SIDECAR_STARTUP_TIMEOUT_SECONDS
         last_err: Optional[Exception] = None
         async with httpx.AsyncClient(timeout=2.0) as client:
-            while time.time() < deadline:
+            while time.monotonic() < deadline:
                 if self._sidecar_proc.poll() is not None:
                     raise RuntimeError(
                         f"Photon sidecar exited with code "
@@ -1002,7 +1037,8 @@ class PhotonAdapter(BasePlatformAdapter):
                     last_err = e
                 await asyncio.sleep(0.2)
         raise RuntimeError(
-            f"Photon sidecar did not become ready within 15s: {last_err}"
+            "Photon sidecar did not become ready within "
+            f"{_SIDECAR_STARTUP_TIMEOUT_SECONDS:g}s: {last_err}"
         )
 
     async def _supervise_sidecar(self, proc: subprocess.Popen) -> None:
@@ -1074,9 +1110,19 @@ class PhotonAdapter(BasePlatformAdapter):
                     proc.kill()
         finally:
             self._sidecar_proc = None
-            if self._sidecar_supervisor_task is not None:
-                self._sidecar_supervisor_task.cancel()
-                self._sidecar_supervisor_task = None
+            supervisor_task = self._sidecar_supervisor_task
+            self._sidecar_supervisor_task = None
+            if (
+                supervisor_task is not None
+                and supervisor_task is not asyncio.current_task()
+            ):
+                supervisor_task.cancel()
+                try:
+                    await supervisor_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
 
     # -- Outbound ----------------------------------------------------------
 
@@ -1545,10 +1591,25 @@ class PhotonAdapter(BasePlatformAdapter):
         # persistent _http_client was created on (e.g. via _run_async in
         # send_message_tool).  The inbound streaming loop continues to use
         # _http_client directly — it always runs on the gateway's loop.
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            return await self._sidecar_request(client, path, body)
+
+    async def _sidecar_health_call(self) -> Dict[str, Any]:
+        """Call healthz with the client owned by the gateway event loop."""
+        client = self._http_client
+        if client is None:
+            raise RuntimeError("Photon adapter not connected")
+        return await self._sidecar_request(client, "/healthz", {})
+
+    async def _sidecar_request(
+        self,
+        client: "httpx.AsyncClient",
+        path: str,
+        body: Dict[str, Any],
+    ) -> Dict[str, Any]:
         url = f"http://{self._sidecar_bind}:{self._sidecar_port}{path}"
         headers = {"X-Hermes-Sidecar-Token": self._sidecar_token}
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(url, json=body, headers=headers)
+        resp = await client.post(url, json=body, headers=headers)
         if resp.status_code != 200:
             raise RuntimeError(
                 f"Photon sidecar {path} returned {resp.status_code}: {resp.text[:200]}"

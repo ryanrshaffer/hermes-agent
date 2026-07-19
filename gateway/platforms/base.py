@@ -2127,6 +2127,11 @@ class BasePlatformAdapter(ABC):
     # (conservative); adapters verified to chunk in ``send()`` set True.
     splits_long_messages: bool = False
 
+    # Optional platform-specific outer connect budget. Most adapters use the
+    # gateway default; adapters with a legitimately slower bounded cold start
+    # can declare a larger value without delaying every other platform.
+    connect_timeout_seconds: float | None = None
+
     # The command prefix users can always TYPE on this platform to reach
     # Hermes commands.  Default "/" (most platforms deliver "/approve" etc.
     # as plain message text).  Platforms where typing a leading "/" is

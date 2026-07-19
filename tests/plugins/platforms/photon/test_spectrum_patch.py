@@ -212,9 +212,11 @@ def test_spectrum_patch_preserves_text_at_runtime(tmp_path: Path) -> None:
     )
     assert patch.returncode == 0, patch.stderr
 
+    # as_uri(): node ESM rejects raw absolute paths as import specifiers on
+    # win32 (ERR_UNSUPPORTED_ESM_URL_SCHEME) — a file:// URL works everywhere.
     harness = textwrap.dedent(
         f"""
-        import {{ rebuildFromAppleMessage, toInboundMessages }} from {str(chunk)!r};
+        import {{ rebuildFromAppleMessage, toInboundMessages }} from {chunk.as_uri()!r};
         const assert = (c, m) => {{ if (!c) {{ console.error("FAIL: " + m); process.exit(1); }} }};
 
         // Mixed text + single attachment -> group [text@0, attachment@1].

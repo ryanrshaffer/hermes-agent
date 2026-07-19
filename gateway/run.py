@@ -3038,7 +3038,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return max(0.0, timeout)
         return _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT
 
-    def _platform_connect_timeout_secs(self) -> float:
+    def _platform_connect_timeout_secs(self, adapter=None) -> float:
         """Return the per-platform connect timeout used during startup/retry."""
         raw = os.getenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "").strip()
         if raw:
@@ -3051,11 +3051,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             else:
                 return max(0.0, timeout)
+        adapter_timeout = getattr(adapter, "connect_timeout_seconds", None)
+        if adapter_timeout is not None:
+            try:
+                return max(0.0, float(adapter_timeout))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring invalid adapter connect_timeout_seconds=%r",
+                    adapter_timeout,
+                )
         return _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT
 
     async def _connect_adapter_with_timeout(self, adapter, platform) -> bool:
         """Connect an adapter without allowing one platform to block others."""
-        timeout = self._platform_connect_timeout_secs()
+        timeout = self._platform_connect_timeout_secs(adapter)
         if timeout <= 0:
             return await adapter.connect()
         try:
@@ -17696,7 +17705,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # is one line, key=value, parent_cmdline last (often long).
         if _shutdown_ctx is not None:
             try:
-                logger.warning(
+                _shutdown_log = (
+                    logger.info if (planned_takeover or planned_stop) else logger.warning
+                )
+                _shutdown_log(
                     "Shutdown context: %s", format_context_for_log(_shutdown_ctx)
                 )
             except Exception as _e:
@@ -17706,13 +17718,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             # a detached subprocess so it can finish writing to disk even
             # if our cgroup is being torn down.  Bounded by an internal
             # timeout; never blocks the event loop here.
-            try:
-                _diag_log = _hermes_home / "logs" / "gateway-shutdown-diag.log"
-                spawn_async_diagnostic(
-                    _diag_log, _shutdown_ctx["signal"], timeout_seconds=5.0
-                )
-            except Exception as _e:
-                logger.debug("spawn_async_diagnostic failed: %s", _e)
+            if not (planned_takeover or planned_stop):
+                try:
+                    _diag_log = _hermes_home / "logs" / "gateway-shutdown-diag.log"
+                    spawn_async_diagnostic(
+                        _diag_log, _shutdown_ctx["signal"], timeout_seconds=5.0
+                    )
+                except Exception as _e:
+                    logger.debug("spawn_async_diagnostic failed: %s", _e)
         asyncio.create_task(runner.stop())
 
     def restart_signal_handler():
