@@ -281,6 +281,32 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     return raw
 
 
+def _read_cdp_override() -> Tuple[str, str]:
+    """Return the raw CDP override and its source without network I/O."""
+    env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
+    if env_override:
+        return env_override, "env"
+
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {})
+        if isinstance(browser_cfg, dict):
+            raw = str(browser_cfg.get("cdp_url", "") or "").strip()
+            if raw:
+                return raw, "config"
+    except Exception as e:
+        logger.debug("Could not read browser.cdp_url from config: %s", e)
+    return "", ""
+
+
+def _has_cdp_override() -> bool:
+    """Return whether a CDP override is configured without probing it."""
+    raw, _source = _read_cdp_override()
+    return bool(raw)
+
+
 def _get_cdp_override() -> str:
     """Return a normalized CDP URL override, or empty string.
 
@@ -292,21 +318,111 @@ def _get_cdp_override() -> str:
     launcher and connect directly to the supplied Chrome DevTools Protocol
     endpoint.
     """
-    env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
-    if env_override:
-        return _resolve_cdp_override(env_override)
+    raw, _source = _read_cdp_override()
+    return _resolve_cdp_override(raw) if raw else ""
 
+
+def _managed_local_cdp_port(raw: str, source: str) -> Optional[int]:
+    """Return the managed local CDP port, or ``None`` for other overrides."""
+    if source != "config" or os.name != "nt":
+        return None
     try:
-        from hermes_cli.config import read_raw_config
+        from urllib.parse import urlparse
 
-        cfg = read_raw_config()
-        browser_cfg = cfg.get("browser", {})
-        if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
-    except Exception as e:
-        logger.debug("Could not read browser.cdp_url from config: %s", e)
+        parsed = urlparse(raw)
+        if (
+            parsed.scheme.lower() == "http"
+            and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+            and parsed.port == 9223
+        ):
+            return parsed.port
+    except (TypeError, ValueError):
+        pass
+    return None
 
-    return ""
+
+def _ensure_managed_local_cdp(port: int) -> None:
+    """Start the existing on-demand Windows CDP task and require readiness."""
+    ensure_script = get_hermes_home() / "browser-cdp" / "Ensure-HermesBrowserCdp.ps1"
+    if not ensure_script.is_file():
+        raise RuntimeError(f"Managed browser CDP ensure script is missing: {ensure_script}")
+
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
+    powershell = os.path.join(
+        os.environ.get("SystemRoot", r"C:\Windows"),
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+    )
+    try:
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(ensure_script),
+                "-Port",
+                str(port),
+                "-WaitSeconds",
+                "30",
+                "-Quiet",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=45,
+            creationflags=windows_hide_flags(),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Managed browser CDP startup failed: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Managed browser CDP startup exited with code {result.returncode}"
+        )
+
+
+def _get_task_cdp_override(task_id: str) -> str:
+    """Resolve and cache one usable CDP endpoint per task/session."""
+    raw, source = _read_cdp_override()
+    if not raw:
+        return ""
+
+    cache_key = (task_id, raw)
+    with _task_cdp_override_lock:
+        cached = _task_cdp_override_cache.get(cache_key)
+        if cached:
+            return cached
+
+        managed_port = _managed_local_cdp_port(raw, source)
+        if managed_port is not None:
+            _ensure_managed_local_cdp(managed_port)
+        resolved = _resolve_cdp_override(raw)
+        if managed_port is not None and not (
+            resolved.lower().startswith(("ws://", "wss://"))
+            and "/devtools/browser/" in resolved.lower()
+        ):
+            raise RuntimeError(
+                f"Managed browser CDP endpoint did not publish a websocket URL: {raw}"
+            )
+        _task_cdp_override_cache[cache_key] = resolved
+        return resolved
+
+
+def _clear_task_cdp_override(task_id: str) -> None:
+    """Drop successful CDP resolutions owned by one completed task."""
+    with _task_cdp_override_lock:
+        stale_keys = [
+            cache_key
+            for cache_key in _task_cdp_override_cache
+            if cache_key[0] == task_id
+        ]
+        for cache_key in stale_keys:
+            _task_cdp_override_cache.pop(cache_key, None)
 
 
 def _get_dialog_policy_config() -> Tuple[str, float]:
@@ -354,25 +470,18 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
     ``browser_navigate`` / ``/browser connect`` without worrying about
     double-attach.
 
-    Resolves the CDP URL in this order:
-      1. ``BROWSER_CDP_URL`` / ``browser.cdp_url`` — covers ``/browser connect``
-         and config-set overrides.
-      2. ``_active_sessions[task_id]["cdp_url"]`` — covers Browserbase + any
-         other cloud provider whose ``create_session`` returns a raw CDP URL.
+    Uses the active session's already-resolved URL first. A live override is
+    resolved only for compatibility with callers that attach before session
+    creation.
 
     Swallows all errors — failing to attach the supervisor must not break
     the browser session itself.  The agent simply won't see
     ``pending_dialogs`` / ``frame_tree`` fields in snapshots.
     """
-    cdp_url = _get_cdp_override()
-    if not cdp_url:
-        # Fallback: active session may carry a per-session CDP URL from a
-        # cloud provider (Browserbase sets this).
-        with _cleanup_lock:
-            session_info = _active_sessions.get(task_id, {})
-        maybe = str(session_info.get("cdp_url") or "")
-        if maybe:
-            cdp_url = _resolve_cdp_override(maybe)
+    with _cleanup_lock:
+        session_info = _active_sessions.get(task_id, {})
+    maybe = str(session_info.get("cdp_url") or "")
+    cdp_url = _resolve_cdp_override(maybe) if maybe else _get_cdp_override()
     if not cdp_url:
         return
     try:
@@ -613,7 +722,7 @@ def _termux_browser_install_error() -> str:
 
 def _is_local_mode() -> bool:
     """Return True when the browser tool will use a local browser backend."""
-    if _get_cdp_override():
+    if _has_cdp_override():
         return False
     return _get_cloud_provider() is None
 
@@ -1089,7 +1198,7 @@ def _navigation_session_key(task_id: str, url: str) -> str:
     """
     if task_id is None:
         task_id = "default"
-    if _get_cdp_override():
+    if _has_cdp_override():
         return task_id
     if _is_camofox_mode():
         return task_id
@@ -1172,6 +1281,8 @@ def _socket_safe_tmpdir() -> str:
 #
 # Stores: session_name (always), bb_session_id + cdp_url (cloud mode only)
 _active_sessions: Dict[str, Dict[str, str]] = {}  # session_key -> {session_name, ...}
+_task_cdp_override_cache: Dict[Tuple[str, str], str] = {}
+_task_cdp_override_lock = threading.Lock()
 _recording_sessions: set = set()  # session_keys with active recordings
 
 # Tracks the most recent session_key used per task_id. Set by browser_navigate()
@@ -1816,7 +1927,7 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     force_local = _is_local_sidecar_key(task_id)
 
     # Create session outside the lock (network call in cloud mode)
-    cdp_override = _get_cdp_override()
+    cdp_override = _get_task_cdp_override(task_id)
     if cdp_override and not force_local:
         session_info = _create_cdp_session(task_id, cdp_override)
     elif force_local:
@@ -3561,6 +3672,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     # (i.e. not when we're only reaping a sidecar mid-task).
     if not _is_local_sidecar_key(task_id):
         _last_active_session_key.pop(bare_task_id, None)
+        _clear_task_cdp_override(bare_task_id)
 
 
 def _cleanup_single_browser_session(task_id: str) -> None:
@@ -3650,6 +3762,8 @@ def cleanup_all_browsers() -> None:
         task_ids = list(_active_sessions.keys())
     for task_id in task_ids:
         cleanup_browser(task_id)
+    with _task_cdp_override_lock:
+        _task_cdp_override_cache.clear()
 
     # Tear down CDP supervisors for all tasks so background threads exit.
     try:
@@ -3804,7 +3918,7 @@ def check_browser_requirements() -> bool:
 
     # CDP override mode can connect to an existing remote/local browser endpoint
     # without requiring the local agent-browser binary on PATH.
-    if _get_cdp_override():
+    if _has_cdp_override():
         return True
 
     # The agent-browser CLI is required for local launch and cloud-provider flows.
