@@ -152,13 +152,22 @@ def maybe_persist_tool_result(
     if len(content) <= effective_threshold:
         return content
 
+    # The spill file is a disk boundary shared by every tool/backend.  Force
+    # redaction here as defense in depth so a tool that missed its own output
+    # sanitizer cannot persist a credential-shaped value in the temp cache.
+    from agent.redact import redact_sensitive_text
+
+    persisted_content = redact_sensitive_text(content, force=True)
     storage_dir = _resolve_storage_dir(env)
     remote_path = f"{storage_dir}/{tool_use_id}.txt"
-    preview, has_more = generate_preview(content, max_chars=config.preview_size)
+    preview, has_more = generate_preview(
+        persisted_content,
+        max_chars=config.preview_size,
+    )
 
     if env is not None:
         try:
-            if _write_to_sandbox(content, remote_path, env):
+            if _write_to_sandbox(persisted_content, remote_path, env):
                 logger.info(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
                     tool_name, tool_use_id, len(content), remote_path,

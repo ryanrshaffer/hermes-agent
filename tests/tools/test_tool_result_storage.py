@@ -376,6 +376,28 @@ class TestMaybePersistToolResult:
         )
         assert "unique_id_abc.txt" in result
 
+    def test_persisted_content_is_force_redacted_at_disk_boundary(self, monkeypatch):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        env.get_temp_dir.return_value = "/tmp"
+        secret = "sk-proj-persistence-boundary-test-1234567890"
+        content = f"ordinary output\nOPENAI_API_KEY={secret}\n" + ("x" * 100)
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="call_redaction_test",
+            env=env,
+            threshold=1,
+        )
+
+        persisted = env.execute.call_args.kwargs["stdin_data"]
+        assert secret not in persisted
+        assert secret not in result
+        assert "ordinary output" in persisted
+        assert "***" in persisted
+
     def test_preview_included_in_persisted_output(self):
         env = MagicMock()
         env.execute.return_value = {"output": "", "returncode": 0}
