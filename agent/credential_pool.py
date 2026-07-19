@@ -124,7 +124,13 @@ _EXTRA_KEYS = frozenset({
     "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
     "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
     "agent_key_obtained_at", "tls", "secret_source", "secret_fingerprint",
+    "scopes",
 })
+
+
+def _entry_scopes(entry: "PooledCredential") -> Optional[list]:
+    scopes = entry.extra.get("scopes")
+    return scopes if isinstance(scopes, list) else None
 
 
 @dataclass
@@ -870,7 +876,8 @@ class CredentialPool:
 
                 refreshed = refresh_anthropic_oauth_pure(
                     entry.refresh_token,
-                    use_json=entry.source.endswith("hermes_pkce"),
+                    use_json=entry.source == "claude_code" or entry.source.endswith("hermes_pkce"),
+                    scopes=_entry_scopes(entry) if entry.source == "claude_code" else None,
                 )
                 updated = replace(
                     entry,
@@ -888,6 +895,7 @@ class CredentialPool:
                             refreshed["access_token"],
                             refreshed["refresh_token"],
                             refreshed["expires_at_ms"],
+                            scopes=_entry_scopes(entry),
                         )
                     except Exception as wexc:
                         logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
@@ -951,7 +959,8 @@ class CredentialPool:
                         from agent.anthropic_adapter import refresh_anthropic_oauth_pure
                         refreshed = refresh_anthropic_oauth_pure(
                             synced.refresh_token,
-                            use_json=synced.source.endswith("hermes_pkce"),
+                            use_json=synced.source == "claude_code" or synced.source.endswith("hermes_pkce"),
+                            scopes=_entry_scopes(synced) if synced.source == "claude_code" else None,
                         )
                         updated = replace(
                             synced,
@@ -970,6 +979,7 @@ class CredentialPool:
                                 refreshed["access_token"],
                                 refreshed["refresh_token"],
                                 refreshed["expires_at_ms"],
+                                scopes=_entry_scopes(synced),
                             )
                         except Exception as wexc:
                             logger.debug("Failed to write refreshed token to credentials file (retry path): %s", wexc)
@@ -1710,6 +1720,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                         "access_token": creds.get("accessToken", ""),
                         "refresh_token": creds.get("refreshToken"),
                         "expires_at_ms": creds.get("expiresAt"),
+                        "scopes": creds.get("scopes"),
                         "label": label_from_token(creds.get("accessToken", ""), source_name),
                     },
                 )

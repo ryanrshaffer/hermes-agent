@@ -1536,6 +1536,57 @@ def test_load_pool_removes_stale_file_backed_singleton_entry(tmp_path, monkeypat
     assert auth_payload["credential_pool"]["anthropic"] == []
 
 
+def test_claude_code_pool_refresh_uses_json_and_scopes(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {"anthropic": []}})
+
+    refresh_calls = []
+    write_calls = []
+
+    def _refresh(refresh_token, **kwargs):
+        refresh_calls.append((refresh_token, kwargs))
+        return {
+            "access_token": "fresh-token",
+            "refresh_token": "fresh-refresh",
+            "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+        }
+
+    def _write(access_token, refresh_token, expires_at_ms, *, scopes=None):
+        write_calls.append((access_token, refresh_token, expires_at_ms, scopes))
+
+    monkeypatch.setattr("agent.anthropic_adapter.refresh_anthropic_oauth_pure", _refresh)
+    monkeypatch.setattr("agent.anthropic_adapter._write_claude_code_credentials", _write)
+
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    pool = CredentialPool("anthropic", [
+        PooledCredential(
+            provider="anthropic",
+            id="claude-code",
+            label="claude_code",
+            auth_type="oauth",
+            priority=0,
+            source="claude_code",
+            access_token="expired-token",
+            refresh_token="refresh-token",
+            expires_at_ms=0,
+            extra={"scopes": ["user:inference", "user:profile"]},
+        )
+    ])
+
+    selected = pool.select()
+
+    assert selected is not None
+    assert selected.access_token == "fresh-token"
+    assert refresh_calls == [(
+        "refresh-token",
+        {"use_json": True, "scopes": ["user:inference", "user:profile"]},
+    )]
+    assert len(write_calls) == 1
+    assert write_calls[0][0:2] == ("fresh-token", "fresh-refresh")
+    assert write_calls[0][3] == ["user:inference", "user:profile"]
+
+
 def test_load_pool_migrates_nous_provider_state_preserves_tls(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(

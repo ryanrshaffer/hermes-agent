@@ -2690,6 +2690,7 @@ class TestAuxiliaryAuthRefreshRetry:
                 "accessToken": "expired-token",
                 "refreshToken": "refresh-token",
                 "expiresAt": 0,
+                "scopes": ["user:inference", "user:profile"],
             }),
             patch("agent.anthropic_adapter.refresh_anthropic_oauth_pure", return_value={
                 "access_token": "fresh-token",
@@ -2702,8 +2703,17 @@ class TestAuxiliaryAuthRefreshRetry:
 
             assert _refresh_provider_credentials("anthropic") is True
 
-        mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=False)
-        mock_write.assert_called_once_with("fresh-token", "refresh-token-2", 9999999999999)
+        mock_refresh_oauth.assert_called_once_with(
+            "refresh-token",
+            use_json=True,
+            scopes=["user:inference", "user:profile"],
+        )
+        mock_write.assert_called_once_with(
+            "fresh-token",
+            "refresh-token-2",
+            9999999999999,
+            scopes=["user:inference", "user:profile"],
+        )
         stale_client.close.assert_called_once()
 
     @pytest.mark.asyncio

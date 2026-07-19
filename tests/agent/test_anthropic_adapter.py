@@ -496,6 +496,7 @@ class TestRefreshOauthToken:
             "accessToken": "old-token",
             "refreshToken": "refresh-123",
             "expiresAt": int(time.time() * 1000) - 3600_000,
+            "scopes": ["user:inference", "user:profile"],
         }
 
         mock_response = json.dumps({
@@ -515,12 +516,18 @@ class TestRefreshOauthToken:
             result = _refresh_oauth_token(creds)
 
         assert result == "new-token-abc"
+        req = mock_urlopen.call_args.args[0]
+        refresh_payload = json.loads(req.data.decode())
+        assert refresh_payload["grant_type"] == "refresh_token"
+        assert refresh_payload["refresh_token"] == "refresh-123"
+        assert refresh_payload["scope"] == "user:inference user:profile"
         # Verify credentials were written back
         cred_file = tmp_path / ".claude" / ".credentials.json"
         assert cred_file.exists()
         written = json.loads(cred_file.read_text())
         assert written["claudeAiOauth"]["accessToken"] == "new-token-abc"
         assert written["claudeAiOauth"]["refreshToken"] == "new-refresh-456"
+        assert written["claudeAiOauth"]["scopes"] == ["user:inference", "user:profile"]
 
     def test_failed_refresh_returns_none(self):
         creds = {

@@ -969,7 +969,12 @@ def is_claude_code_token_valid(creds: Dict[str, Any]) -> bool:
     return now_ms < (expires_at - 60_000)
 
 
-def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) -> Dict[str, Any]:
+def refresh_anthropic_oauth_pure(
+    refresh_token: str,
+    *,
+    use_json: bool = False,
+    scopes: Optional[list] = None,
+) -> Dict[str, Any]:
     """Refresh an Anthropic OAuth token without mutating local credential files."""
     import time
     import urllib.parse
@@ -980,11 +985,15 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
 
     client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     if use_json:
-        data = json.dumps({
+        payload: Dict[str, Any] = {
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "client_id": client_id,
-        }).encode()
+        }
+        scope_values = [str(scope).strip() for scope in scopes or [] if str(scope).strip()]
+        if scope_values:
+            payload["scope"] = " ".join(scope_values)
+        data = json.dumps(payload).encode()
         content_type = "application/json"
     else:
         data = urllib.parse.urlencode({
@@ -1041,11 +1050,17 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
         return None
 
     try:
-        refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
+        scopes = creds.get("scopes")
+        refreshed = refresh_anthropic_oauth_pure(
+            refresh_token,
+            use_json=True,
+            scopes=scopes if isinstance(scopes, list) else None,
+        )
         _write_claude_code_credentials(
             refreshed["access_token"],
             refreshed["refresh_token"],
             refreshed["expires_at_ms"],
+            scopes=scopes if isinstance(scopes, list) else None,
         )
         logger.debug("Successfully refreshed Claude Code OAuth token")
         return refreshed["access_token"]
