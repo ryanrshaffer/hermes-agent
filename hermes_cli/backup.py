@@ -256,24 +256,34 @@ def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> 
 def _safe_copy_db(src: Path, dst: Path) -> bool:
     """Copy a SQLite database safely using the backup() API.
 
-    Handles WAL mode — produces a consistent snapshot even while
-    the DB is being written to.  Falls back to raw copy on failure.
+    Handles WAL mode — produces a consistent snapshot even while the DB is
+    being written to. A failed consistent snapshot is a backup failure; a raw
+    copy of a live database is never accepted as a fallback.
     """
+    conn = None
+    backup_conn = None
+    snapshot_error = None
     try:
         conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
         backup_conn = sqlite3.connect(str(dst))
         conn.backup(backup_conn)
-        backup_conn.close()
-        conn.close()
-        return True
     except Exception as exc:
-        logger.warning("SQLite safe copy failed for %s: %s", src, exc)
-        try:
-            shutil.copy2(src, dst)
-            return True
-        except Exception as exc2:
-            logger.error("Raw copy also failed for %s: %s", src, exc2)
-            return False
+        snapshot_error = exc
+        logger.error("SQLite consistent copy failed for %s: %s", src, exc)
+    finally:
+        if backup_conn is not None:
+            backup_conn.close()
+        if conn is not None:
+            conn.close()
+
+    if snapshot_error is None:
+        return True
+
+    try:
+        dst.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Could not remove partial SQLite snapshot %s", dst)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +389,7 @@ def run_backup(args) -> None:
 
     total_bytes = 0
     errors = []
+    database_errors = []
     t0 = time.monotonic()
 
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
@@ -400,7 +411,9 @@ def run_backup(args) -> None:
                         tmp_db.unlink(missing_ok=True)
                     else:
                         tmp_db.unlink(missing_ok=True)
-                        errors.append(f"  {rel_path}: SQLite safe copy failed")
+                        message = f"  {rel_path}: SQLite consistent copy failed"
+                        errors.append(message)
+                        database_errors.append(message)
                         continue
                 else:
                     zf.write(abs_path, arcname=str(rel_path))
@@ -423,6 +436,13 @@ def run_backup(args) -> None:
             except (PermissionError, OSError, ValueError) as exc:
                 errors.append(f"  {arcname}: {exc}")
                 continue
+
+    if database_errors:
+        out_path.unlink(missing_ok=True)
+        print("Backup failed: one or more SQLite databases could not be snapshotted consistently.")
+        for error in database_errors:
+            print(error)
+        sys.exit(1)
 
     elapsed = time.monotonic() - t0
     zip_size = out_path.stat().st_size
@@ -1143,6 +1163,7 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
     if not files_to_add:
         return None
 
+    database_snapshot_failed = False
     try:
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             for abs_path, rel_path in files_to_add:
@@ -1159,6 +1180,8 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
                         try:
                             if _safe_copy_db(abs_path, tmp_db):
                                 zf.write(tmp_db, arcname=str(rel_path))
+                            else:
+                                database_snapshot_failed = True
                         finally:
                             tmp_db.unlink(missing_ok=True)
                     else:
@@ -1173,6 +1196,14 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
             out_path.unlink(missing_ok=True)
         except OSError:
             pass
+        return None
+
+    if database_snapshot_failed:
+        logger.error("Full-zip backup failed: a SQLite database could not be snapshotted consistently")
+        try:
+            out_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove incomplete full-zip backup %s", out_path)
         return None
 
     return out_path

@@ -15,12 +15,18 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _make_sqlite_db(path: Path) -> None:
+    """Create a minimal valid SQLite database for backup integration tests."""
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE backup_fixture (id INTEGER PRIMARY KEY)")
+
+
 def _make_hermes_tree(root: Path) -> None:
     """Create a realistic ~/.hermes directory structure for testing."""
     (root / "config.yaml").write_text("model:\n  provider: openrouter\n")
     (root / ".env").write_text("OPENROUTER_API_KEY=sk-test-123\n")
-    (root / "memory_store.db").write_bytes(b"fake-sqlite")
-    (root / "hermes_state.db").write_bytes(b"fake-state")
+    _make_sqlite_db(root / "memory_store.db")
+    _make_sqlite_db(root / "hermes_state.db")
 
     # Sessions
     (root / "sessions").mkdir(exist_ok=True)
@@ -1043,7 +1049,9 @@ class TestBackupEdgeCases:
         (hermes_home / "config.yaml").write_text("model: test\n")
 
         # Create an unreadable file
-        bad_file = hermes_home / "secret.db"
+        # Use a regular file here. SQLite snapshot failures intentionally abort
+        # the entire backup, while ordinary unreadable files remain skippable.
+        bad_file = hermes_home / "secret.txt"
         bad_file.write_text("data")
         bad_file.chmod(0o000)
 
@@ -1368,6 +1376,52 @@ class TestSafeCopyDb:
         rows = conn.execute("SELECT x FROM t").fetchall()
         conn.close()
         assert rows == [("wal-test",)]
+
+    def test_rejects_invalid_database_without_raw_copy(self, tmp_path):
+        from hermes_cli.backup import _safe_copy_db
+        src = tmp_path / "invalid.db"
+        dst = tmp_path / "copy.db"
+        src.write_bytes(b"not a sqlite database")
+
+        result = _safe_copy_db(src, dst)
+
+        assert result is False
+        assert not dst.exists()
+
+    def test_run_backup_removes_archive_when_database_snapshot_fails(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.backup as backup_mod
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        out_zip = tmp_path / "backup.zip"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(backup_mod, "_safe_copy_db", lambda *_: False)
+
+        with pytest.raises(SystemExit) as exc:
+            backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        assert exc.value.code == 1
+        assert not out_zip.exists()
+
+    def test_full_zip_removes_archive_when_database_snapshot_fails(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.backup as backup_mod
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        out_zip = tmp_path / "pre-update.zip"
+        monkeypatch.setattr(backup_mod, "_safe_copy_db", lambda *_: False)
+
+        result = backup_mod._write_full_zip_backup(out_zip, hermes_home)
+
+        assert result is None
+        assert not out_zip.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -2163,7 +2217,7 @@ class TestMemoryProviderExternalPaths:
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "config.yaml").write_text("model:\n  provider: openrouter\n")
         (hermes_home / ".env").write_text("OPENROUTER_API_KEY=sk-test\n")
-        (hermes_home / "state.db").write_bytes(b"x")
+        _make_sqlite_db(hermes_home / "state.db")
 
     def test_backup_captures_external_paths_under_external_prefix(self, tmp_path, monkeypatch):
         """Provider state under ~/.honcho is archived beneath _external/,
