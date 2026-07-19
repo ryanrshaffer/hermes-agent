@@ -209,6 +209,14 @@ def _billing_or_entitlement_message(
         ),
         "Add credits or update billing with that provider, then retry.",
     ]
+    if (provider or "").strip().lower() == "anthropic" or base_url_host_matches(str(base_url or ""), "anthropic.com"):
+        lines = [
+            (
+                "Anthropic reported that this OAuth request needs Claude "
+                f"extra usage for {model_label}."
+            ),
+            "Enable or add Claude extra usage, then retry: https://claude.ai/settings/usage",
+        ]
     if base_url_host_matches(str(base_url or ""), "openrouter.ai"):
         lines.append("OpenRouter credits: https://openrouter.ai/settings/credits")
     lines.append("You can switch providers temporarily with /model <model> --provider <provider>.")
@@ -3401,6 +3409,28 @@ def run_conversation(
                             final_response=_policy_response,
                             error_detail=_nonretryable_summary,
                         )
+                    if classified.reason == FailoverReason.billing:
+                        _billing_guidance = _billing_or_entitlement_message(
+                            capability="model access",
+                            provider=_provider,
+                            base_url=str(_base),
+                            model=_model,
+                        )
+                        _billing_response = (
+                            "Billing, credits, or account entitlement blocked "
+                            "the provider request."
+                        )
+                        if _billing_guidance:
+                            _billing_response += f"\n\n{_billing_guidance}"
+                        return {
+                            "final_response": _billing_response,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _nonretryable_summary,
+                            "failure_reason": classified.reason.value,
+                        }
                     return {
                         "final_response": None,
                         "messages": messages,

@@ -1231,6 +1231,27 @@ class TestAdversarialEdgeCases:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.billing
 
+    def test_anthropic_third_party_extra_usage_400_is_billing(self):
+        e = MockAPIError(
+            "anthropic extra usage",
+            status_code=400,
+            body={
+                "error": {
+                    "message": (
+                        "Third-party apps now draw from your extra usage, not "
+                        "your plan limits. Add more at claude.ai/settings/usage "
+                        "and keep going."
+                    )
+                }
+            },
+        )
+
+        result = classify_api_error(e, provider="anthropic")
+
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_fallback is True
+
     def test_200_with_error_body(self):
         """200 status with error in body — should be unknown, not crash."""
         class WeirdSuccess(Exception):
