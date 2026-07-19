@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Vapi webhook receiver for Ryan's Riley voice assistant.
+"""Local-only Vapi webhook receiver for Ryan's Riley voice assistant.
 
 - Validates X-Vapi-Webhook-Secret.
-- Handles transfer-destination-request by returning Ryan's escalation number.
-- Logs end-of-call reports to Discord forum (one post per call).
 - Writes a durable Obsidian markdown note and raw JSON artifact.
+- Fails closed for call transfers and external delivery pending explicit approval.
 
 Stdlib-only so it can run under the Hermes Windows install without extra deps.
 """
@@ -16,12 +15,18 @@ import re
 import sys
 import time
 import traceback
-import urllib.error
-import urllib.request
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from obsidian_vault_guard import (  # noqa: E402
+    CANONICAL_OBSIDIAN_VAULT,
+    require_canonical_obsidian_vault,
+)
 
 
 def _load_env_file() -> None:
@@ -44,10 +49,9 @@ _load_env_file()
 
 PORT = int(os.environ.get("VAPI_WEBHOOK_PORT", "8787"))
 WEBHOOK_SECRET = os.environ.get("VAPI_WEBHOOK_SECRET", "")
-ESCALATION_NUMBER = os.environ.get("VAPI_ESCALATION_NUMBER", "")
-DISCORD_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-DISCORD_FORUM_ID = os.environ.get("DISCORD_VOICE_CALL_FORUM_ID", "")
-OBSIDIAN_VAULT = os.environ.get("OBSIDIAN_VAULT_PATH", str(Path.home() / "Documents" / "Obsidian Vault"))
+OBSIDIAN_VAULT = os.environ.get("OBSIDIAN_VAULT_PATH") or str(CANONICAL_OBSIDIAN_VAULT)
+
+
 def _resolve_log_dir() -> Path:
     explicit = os.environ.get("VAPI_CALL_LOG_DIR")
     if explicit:
@@ -126,69 +130,17 @@ def _summarize_call(message: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _discord_request(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    if not DISCORD_TOKEN:
-        raise RuntimeError("DISCORD_BOT_TOKEN missing")
-    url = f"https://discord.com/api/v10{path}"
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method=method, headers={
-        "Authorization": f"Bot {DISCORD_TOKEN}",
-        "Content-Type": "application/json",
-        "User-Agent": "Hermes-Vapi-Webhook/1.0",
-    })
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read().decode("utf-8", "replace")
-        return json.loads(raw) if raw else {}
-
-
-def _chunk(text: str, n: int = 1800) -> list[str]:
-    text = text or ""
-    return [text[i:i+n] for i in range(0, len(text), n)] or [""]
-
-
-def _post_discord(summary: dict[str, str], note_path: Path | None) -> str:
-    if not DISCORD_FORUM_ID:
-        raise RuntimeError("DISCORD_VOICE_CALL_FORUM_ID missing")
-    title_bits = ["Call"]
-    if summary["customer_name"] and summary["customer_name"] != "Unknown caller":
-        title_bits.append(summary["customer_name"])
-    elif summary["customer_number"]:
-        title_bits.append(summary["customer_number"][-4:].rjust(len(summary["customer_number"]), "*"))
-    title_bits.append(datetime.now().strftime("%Y-%m-%d %H:%M"))
-    thread_name = _safe_name(" - ".join(title_bits), "voice-call")[:90]
-    content = (
-        f"## Voice call log\n"
-        f"**Urgency:** {summary['urgency']}\n"
-        f"**Caller:** {summary['customer_name']} {summary['customer_number']}\n"
-        f"**Call ID:** `{summary['call_id']}`\n"
-        f"**Started:** {summary['started']}\n"
-        f"**Ended:** {summary['ended']}\n"
-        f"**End reason:** {summary['ended_reason']}\n"
-        f"**Cost:** {summary['cost']}\n"
-        f"**Recording:** {summary['recording'] or 'not provided'}\n"
-        f"**Obsidian note:** {note_path if note_path else 'not written'}\n\n"
-        f"**Summary**\n{summary['summary'][:900]}"
-    )[:1900]
-    created = _discord_request("POST", f"/channels/{DISCORD_FORUM_ID}/threads", {
-        "name": thread_name,
-        "auto_archive_duration": 10080,
-        "message": {"content": content},
-    })
-    thread_id = created.get("id")
-    if thread_id and summary["transcript"]:
-        for idx, part in enumerate(_chunk(summary["transcript"], 1800), 1):
-            _discord_request("POST", f"/channels/{thread_id}/messages", {"content": f"**Transcript part {idx}**\n```\n{part}\n```"[:2000]})
-    return str(thread_id or "")
-
-
 def _write_obsidian(summary: dict[str, str], raw: dict[str, Any]) -> Path:
-    vault = Path(OBSIDIAN_VAULT)
-    day = datetime.now().strftime("%Y-%m-%d")
+    vault = require_canonical_obsidian_vault(
+        OBSIDIAN_VAULT, canonical=CANONICAL_OBSIDIAN_VAULT
+    )
+    call_timestamp = summary.get("started") or summary.get("ended") or ""
+    day_match = re.search(r"\d{4}-\d{2}-\d{2}", call_timestamp)
+    day = day_match.group(0) if day_match else "undated"
     folder = vault / "OwnerOps" / "Voice Calls" / day
     folder.mkdir(parents=True, exist_ok=True)
     call_id = _safe_name(summary["call_id"])
-    name = _safe_name(summary["customer_name"], "unknown-caller")
-    note = folder / f"{datetime.now().strftime('%H%M%S')}-{name}-{call_id}.md"
+    note = folder / f"{call_id}.md"
     raw_path = folder / f"{note.stem}.json"
     raw_path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
     md = f"""# Voice Call — {summary['customer_name']}
@@ -224,27 +176,26 @@ def handle_payload(payload: dict[str, Any]) -> tuple[int, bytes, dict[str, str]]
     (LOG_DIR / f"{_safe_name(call_id)}-{int(time.time())}.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     if msg_type == "transfer-destination-request":
-        return _json({
-            "destination": {
-                "type": "number",
-                "number": ESCALATION_NUMBER,
-                "message": "I’m going to try Ryan now. One moment."
-            }
-        })
+        return _json(
+            {
+                "error": "external_communication_requires_explicit_approval",
+                "transfer_authorized": False,
+            },
+            409,
+        )
 
     if msg_type == "end-of-call-report":
         summary = _summarize_call(message)
         note_path = None
-        discord_thread = ""
         try:
             note_path = _write_obsidian(summary, payload)
         except Exception:
             traceback.print_exc()
-        try:
-            discord_thread = _post_discord(summary, note_path)
-        except Exception:
-            traceback.print_exc()
-        return _json({"ok": True, "call_id": call_id, "obsidian_note": str(note_path or ""), "discord_thread_id": discord_thread})
+        return _json({
+            "ok": True,
+            "obsidian_note_written": bool(note_path),
+            "external_delivery": "not_attempted_approval_required",
+        })
 
     return _json({"ok": True, "ignored_type": msg_type or "unknown", "call_id": call_id})
 
