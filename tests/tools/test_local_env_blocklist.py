@@ -404,10 +404,14 @@ class TestSanePathIncludesHomebrew:
     def test_make_run_env_appends_homebrew_on_minimal_path(self):
         """When PATH is minimal, _make_run_env appends missing sane entries."""
         from tools.environments.local import _SANE_PATH, _make_run_env
-        minimal_env = {"PATH": "/some/custom/bin"}
+        original_entries = ["/some/custom/bin"]
+        minimal_env = {"PATH": os.pathsep.join(original_entries)}
         with patch.dict(os.environ, minimal_env, clear=True):
             result = _make_run_env({})
-        path_entries = result["PATH"].split(":")
+        path_entries = result["PATH"].split(os.pathsep)
+        if os.name == "nt":
+            assert path_entries == original_entries
+            return
         assert path_entries[0] == "/some/custom/bin"
         for entry in _SANE_PATH.split(":"):
             assert entry in path_entries
@@ -415,10 +419,14 @@ class TestSanePathIncludesHomebrew:
     def test_make_run_env_fills_missing_homebrew_when_usr_bin_present(self):
         """macOS launchd PATH can include /usr/bin while missing Homebrew."""
         from tools.environments.local import _make_run_env
-        launchd_env = {"PATH": "/usr/local/bin:/usr/bin:/bin"}
+        original_entries = ["/usr/local/bin", "/usr/bin", "/bin"]
+        launchd_env = {"PATH": os.pathsep.join(original_entries)}
         with patch.dict(os.environ, launchd_env, clear=True):
             result = _make_run_env({})
-        path_entries = result["PATH"].split(":")
+        path_entries = result["PATH"].split(os.pathsep)
+        if os.name == "nt":
+            assert path_entries == original_entries
+            return
         assert "/opt/homebrew/bin" in path_entries
         assert "/opt/homebrew/sbin" in path_entries
 
@@ -435,34 +443,48 @@ class TestSanePathIncludesHomebrew:
     def test_make_run_env_real_launchd_path_gains_homebrew(self):
         """The literal macOS launchd PATH is the production trigger for #35613."""
         from tools.environments.local import _make_run_env
-        launchd_env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
+        original_entries = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        launchd_env = {"PATH": os.pathsep.join(original_entries)}
         with patch.dict(os.environ, launchd_env, clear=True):
             result = _make_run_env({})
-        path_entries = result["PATH"].split(":")
+        path_entries = result["PATH"].split(os.pathsep)
+        if os.name == "nt":
+            assert path_entries == original_entries
+            return
         assert "/opt/homebrew/bin" in path_entries
         assert "/opt/homebrew/sbin" in path_entries
         # Original entries keep their leading precedence.
-        assert path_entries[:4] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        assert path_entries[:4] == original_entries
 
-    def test_make_run_env_collapses_duplicate_caller_entries(self):
-        """Duplicates already present in the caller PATH are de-duplicated."""
+    def test_make_run_env_normalizes_duplicates_only_on_posix(self):
+        """POSIX de-duplicates PATH; native Windows PATH is preserved."""
         from tools.environments.local import _make_run_env
-        dup_env = {"PATH": "/usr/bin:/usr/bin:/custom/bin:/custom/bin:/bin"}
+        original_entries = [
+            "/usr/bin", "/usr/bin", "/custom/bin", "/custom/bin", "/bin"
+        ]
+        dup_env = {"PATH": os.pathsep.join(original_entries)}
         with patch.dict(os.environ, dup_env, clear=True):
             result = _make_run_env({})
-        path_entries = result["PATH"].split(":")
+        path_entries = result["PATH"].split(os.pathsep)
+        if os.name == "nt":
+            assert path_entries == original_entries
+            return
         assert path_entries.count("/usr/bin") == 1
         assert path_entries.count("/custom/bin") == 1
         # First-occurrence order is preserved for the caller entries.
         assert path_entries[:3] == ["/usr/bin", "/custom/bin", "/bin"]
 
-    def test_make_run_env_strips_empty_path_entries(self):
-        """Leading/trailing/double colons (== CWD on POSIX) are dropped."""
+    def test_make_run_env_normalizes_empty_entries_only_on_posix(self):
+        """POSIX drops empty PATH entries; native Windows PATH is preserved."""
         from tools.environments.local import _make_run_env
-        empty_env = {"PATH": "/usr/bin::/bin:"}
+        original_entries = ["/usr/bin", "", "/bin", ""]
+        empty_env = {"PATH": os.pathsep.join(original_entries)}
         with patch.dict(os.environ, empty_env, clear=True):
             result = _make_run_env({})
-        path_entries = result["PATH"].split(":")
+        path_entries = result["PATH"].split(os.pathsep)
+        if os.name == "nt":
+            assert path_entries == original_entries
+            return
         assert "" not in path_entries
         assert "/usr/bin" in path_entries
         assert "/opt/homebrew/bin" in path_entries
@@ -532,9 +554,10 @@ class TestHermesBinDirOnPath:
         from tools.environments import local as local_mod
         self._reset_cache()
         local_mod._HERMES_BIN_DIR = "/opt/hermes/bin"
-        out = local_mod._prepend_hermes_bin_dir("/usr/bin:/bin")
+        original_entries = ["/usr/bin", "/bin"]
+        out = local_mod._prepend_hermes_bin_dir(os.pathsep.join(original_entries))
         assert out.split(os.pathsep)[0] == "/opt/hermes/bin"
-        assert "/usr/bin" in out.split(os.pathsep)
+        assert out.split(os.pathsep)[1:] == original_entries
 
     def test_prepend_is_idempotent(self, monkeypatch):
         from tools.environments import local as local_mod
@@ -551,15 +574,19 @@ class TestHermesBinDirOnPath:
         local_mod._HERMES_BIN_DIR = None
         assert local_mod._prepend_hermes_bin_dir("/usr/bin:/bin") == "/usr/bin:/bin"
 
-    def test_make_run_env_injects_hermes_bin_dir(self, monkeypatch):
+    def test_make_run_env_injects_hermes_bin_dir(self):
         """A gateway env missing the hermes dir gets it back in the subshell PATH."""
         from tools.environments import local as local_mod
         from tools.environments.local import _make_run_env
         self._reset_cache()
         local_mod._HERMES_BIN_DIR = "/opt/hermes/bin"
-        monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
-        with patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}, clear=True):
+        original_entries = ["/usr/bin", "/bin"]
+        with patch.dict(
+            os.environ,
+            {"PATH": os.pathsep.join(original_entries)},
+            clear=True,
+        ):
             result = _make_run_env({})
         entries = result["PATH"].split(os.pathsep)
         assert entries[0] == "/opt/hermes/bin"
-        assert "/usr/bin" in entries
+        assert entries[1 : 1 + len(original_entries)] == original_entries

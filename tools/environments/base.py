@@ -25,6 +25,82 @@ from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
 
+
+# Credential-bearing environment variables must remain available to the
+# trusted terminal subprocess, but must not be serialized into the persistent
+# session snapshot.  Keep these patterns deliberately name-based: inspecting
+# values would itself widen secret handling, while these conventional names
+# cover provider tokens, passwords, private/access keys, cookies, and common
+# credential-bearing connection strings.
+_SNAPSHOT_CREDENTIAL_NAME_GLOBS = (
+    "*API_KEY*",
+    "*APIKEY*",
+    "*TOKEN*",
+    "*SECRET*",
+    "*PASSWORD*",
+    "*PASSWD*",
+    "*PASSPHRASE*",
+    "*CREDENTIAL*",
+    "*PRIVATE_KEY*",
+    "*ACCESS_KEY*",
+    "*SIGNING_KEY*",
+    "*ENCRYPTION_KEY*",
+    "*MASTER_KEY*",
+    "*CLIENT_KEY*",
+    "*ACCOUNT_KEY*",
+    "*SUBSCRIPTION_KEY*",
+    "*_PAT",
+    "*AUTHORIZATION*",
+    "*BEARER*",
+    "*COOKIE*",
+    "*CONNECTION_STRING*",
+    "*DATABASE_URL*",
+    "*DB_URL*",
+    "*REDIS_URL*",
+    "*MONGO_URI*",
+    "*SMTP_URL*",
+    "*AMQP_URL*",
+    "*BROKER_URL*",
+    "*WEBHOOK_URL*",
+    "*DSN*",
+    "*NETRC*",
+    "*SERVICE_ACCOUNT*",
+)
+_SNAPSHOT_NON_SECRET_NAME_ALLOWLIST = (
+    # Boolean logging policy, not credential material despite its name.
+    "HERMES_REDACT_SECRETS",
+    # Hugging Face tokenizer runtime toggle, not an authentication token.
+    "TOKENIZERS_PARALLELISM",
+)
+
+
+def _snapshot_export_command(quoted_snapshot_path: str) -> str:
+    """Return Bash that writes only non-credential exports to a snapshot.
+
+    The filtering happens in a subshell and cannot alter the command's live
+    environment.  Each allowed export is serialized individually, so even a
+    read-only credential variable cannot bypass the name filter.
+    ``nocasematch`` keeps the policy deterministic for mixed/lower-case names
+    without relying on an external ``tr`` binary.
+
+    ``quoted_snapshot_path`` must already be shell-quoted by the caller.
+    """
+    credential_patterns = "|".join(_SNAPSHOT_CREDENTIAL_NAME_GLOBS)
+    allowed_names = "|".join(_SNAPSHOT_NON_SECRET_NAME_ALLOWLIST)
+    return (
+        "(\n"
+        "  shopt -s nocasematch\n"
+        "  while IFS= read -r __hermes_env_name; do\n"
+        "    case \"$__hermes_env_name\" in\n"
+        f"      {allowed_names}) ;;\n"
+        f"      {credential_patterns}) continue ;;\n"
+        "    esac\n"
+        "    declare -p \"$__hermes_env_name\" 2>/dev/null || true\n"
+        "  done < <(compgen -e)\n"
+        f") > {quoted_snapshot_path}"
+    )
+
+
 # Opt-in debug tracing for the interrupt/activity/poll machinery.  Set
 # HERMES_DEBUG_INTERRUPT=1 to log loop entry/exit, periodic heartbeats, and
 # every is_interrupted() state change from _wait_for_process.  Off by default
@@ -370,7 +446,7 @@ class BaseEnvironment(ABC):
         _quoted_snap = shlex.quote(self._snapshot_path)
         _quoted_cwd_file = shlex.quote(self._cwd_file)
         bootstrap = (
-            f"export -p > {_quoted_snap}\n"
+            f"{_snapshot_export_command(_quoted_snap)}\n"
             f"declare -f | grep -vE '^_[^_]' >> {_quoted_snap}\n"
             f"alias -p >> {_quoted_snap}\n"
             f"echo 'shopt -s expand_aliases' >> {_quoted_snap}\n"
@@ -451,7 +527,9 @@ class BaseEnvironment(ABC):
 
         # Re-dump env vars to snapshot (last-writer-wins for concurrent calls)
         if self._snapshot_ready:
-            parts.append(f"export -p > {_quoted_snap} 2>/dev/null || true")
+            parts.append(
+                f"{_snapshot_export_command(_quoted_snap)} 2>/dev/null || true"
+            )
 
         # Write CWD to file (local reads this) and stdout marker (remote parses this)
         parts.append(f"pwd -P > {_quoted_cwd_file} 2>/dev/null || true")

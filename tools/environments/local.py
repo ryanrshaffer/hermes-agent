@@ -1,5 +1,6 @@
 """Local execution environment — spawn-per-call with session snapshot."""
 
+import csv
 import logging
 import os
 import platform
@@ -9,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -18,6 +20,139 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 _IS_WINDOWS = platform.system() == "Windows"
 
 logger = logging.getLogger(__name__)
+
+_TERMINAL_ARTIFACT_MAX_AGE_SECONDS = 24 * 60 * 60
+_TERMINAL_ARTIFACT_NAME_RE = re.compile(
+    r"^hermes-(?:snap-[0-9a-f]{12}\.sh|cwd-[0-9a-f]{12}\.txt)$",
+    re.IGNORECASE,
+)
+_TOOL_RESULT_ARTIFACT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+_TOOL_RESULT_ARTIFACT_NAME_RE = re.compile(
+    r"^[a-z0-9][a-z0-9_-]{0,254}\.txt$",
+    re.IGNORECASE,
+)
+_WINDOWS_SYSTEM_SID = "S-1-5-18"
+_WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544"
+_secured_windows_cache_dirs: set[str] = set()
+_secured_windows_cache_dirs_lock = threading.Lock()
+
+
+def _windows_current_user_sid() -> str:
+    """Return the current Windows identity SID without localized name parsing."""
+    try:
+        result = subprocess.run(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            creationflags=windows_hide_flags(),
+            check=False,
+        )
+    except OSError as exc:
+        raise OSError("Unable to resolve the Windows user SID") from exc
+    if result.returncode != 0:
+        raise OSError("Unable to resolve the Windows user SID")
+
+    try:
+        row = next(csv.reader([result.stdout.strip()]))
+        sid = row[-1].strip()
+    except (csv.Error, IndexError, StopIteration) as exc:
+        raise OSError("Unable to parse the Windows user SID") from exc
+    if not re.fullmatch(r"S-\d-(?:\d+-)+\d+", sid, re.IGNORECASE):
+        raise OSError("Windows returned an invalid user SID")
+    return sid
+
+
+def _secure_windows_terminal_cache_dir(cache_dir: Path) -> None:
+    """Protect the terminal cache DACL before any session artifact is made.
+
+    ``icacls`` is part of Windows, so this adds no runtime dependency.  Reset
+    first to remove any stale explicit grants, add the three recovery-safe
+    principals by SID, then remove inherited grants.  New files therefore
+    receive the protected DACL at creation instead of being tightened after a
+    plaintext snapshot has already existed.
+    """
+    if not _IS_WINDOWS:
+        return
+
+    cache_key = os.path.normcase(os.path.abspath(cache_dir))
+    with _secured_windows_cache_dirs_lock:
+        if cache_key in _secured_windows_cache_dirs:
+            return
+
+        current_sid = _windows_current_user_sid()
+        common = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "timeout": 10,
+            "creationflags": windows_hide_flags(),
+            "check": False,
+        }
+        commands = (
+            ["icacls", str(cache_dir), "/reset", "/Q"],
+            [
+                "icacls",
+                str(cache_dir),
+                "/grant:r",
+                f"*{current_sid}:(OI)(CI)F",
+                f"*{_WINDOWS_SYSTEM_SID}:(OI)(CI)F",
+                f"*{_WINDOWS_ADMINISTRATORS_SID}:(OI)(CI)F",
+                "/Q",
+            ],
+            ["icacls", str(cache_dir), "/inheritance:r", "/Q"],
+        )
+        try:
+            for command in commands:
+                result = subprocess.run(command, **common)
+                if result.returncode != 0:
+                    raise OSError("Unable to protect the terminal cache ACL")
+        except OSError as exc:
+            raise OSError("Unable to protect the terminal cache ACL") from exc
+
+        _secured_windows_cache_dirs.add(cache_key)
+
+
+def _cleanup_stale_terminal_artifacts(
+    cache_dir: Path,
+    *,
+    now: float | None = None,
+) -> int:
+    """Remove only strict, expired Hermes terminal-cache artifacts."""
+    current_time = time.time() if now is None else now
+    artifact_groups = (
+        (
+            cache_dir,
+            _TERMINAL_ARTIFACT_NAME_RE,
+            current_time - _TERMINAL_ARTIFACT_MAX_AGE_SECONDS,
+        ),
+        (
+            cache_dir / "hermes-results",
+            _TOOL_RESULT_ARTIFACT_NAME_RE,
+            current_time - _TOOL_RESULT_ARTIFACT_MAX_AGE_SECONDS,
+        ),
+    )
+    removed = 0
+
+    for artifact_dir, name_pattern, cutoff in artifact_groups:
+        try:
+            candidates = list(artifact_dir.iterdir())
+        except OSError:
+            continue
+
+        for path in candidates:
+            if not name_pattern.fullmatch(path.name):
+                continue
+            try:
+                if path.is_dir() or path.lstat().st_mtime > cutoff:
+                    continue
+                path.unlink()
+                removed += 1
+            except OSError:
+                continue
+    return removed
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -581,6 +716,9 @@ class LocalEnvironment(BaseEnvironment):
         if cwd:
             cwd = os.path.expanduser(cwd)
         super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
+        removed = _cleanup_stale_terminal_artifacts(Path(self._snapshot_path).parent)
+        if removed:
+            logger.info("Removed %d stale terminal session artifact(s)", removed)
         self.init_session()
 
     def get_temp_dir(self) -> str:
@@ -613,7 +751,11 @@ class LocalEnvironment(BaseEnvironment):
                 cache_dir = get_hermes_home() / "cache" / "terminal"
             except Exception:
                 cache_dir = Path(tempfile.gettempdir()) / "hermes_terminal"
-            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # Some cross-platform tests simulate ``_IS_WINDOWS`` to exercise
+            # MSYS path handling.  Only invoke native ACL tooling on NT.
+            if os.name == "nt":
+                _secure_windows_terminal_cache_dir(cache_dir)
             # Force forward slashes so the same string serves both contexts.
             return str(cache_dir).replace("\\", "/")
 
