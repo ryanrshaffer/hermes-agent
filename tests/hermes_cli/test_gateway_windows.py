@@ -337,7 +337,9 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
     assert "pythonw.exe" in content
     assert "hermes_cli.main" in content
     assert "gateway run" in content
-    assert ", 0, False" in content  # hidden window, detached/async
+    assert ", 0, True" in content  # hidden window, supervised by Task Scheduler
+    assert "exit_code = sh.Run(" in content
+    assert "WScript.Quit exit_code" in content
     for var in ("HERMES_HOME", "PYTHONIOENCODING", "HERMES_GATEWAY_DETACHED", "VIRTUAL_ENV", "PYTHONPATH"):
         assert var in content
     assert "--profile" in content and "work" in content
@@ -384,8 +386,80 @@ def test_quote_vbs_string_doubles_quotes_and_rejects_newlines():
         gateway_windows._quote_vbs_string("line1\nline2")
 
 
-def test_install_scheduled_task_success_start_now_uses_direct_spawn_not_task_run(monkeypatch, tmp_path, capsys):
-    """Install start-now should not /Run the task; that preserved old restart loops."""
+def test_gateway_ready_rejects_process_without_running_runtime(monkeypatch):
+    from gateway import status as status_mod
+
+    monkeypatch.setattr(status_mod, "read_runtime_status", lambda: {"gateway_state": "starting", "pid": 123})
+    monkeypatch.setattr(status_mod, "get_running_pid", lambda cleanup_stale=False: 123)
+    monkeypatch.setattr(status_mod, "get_runtime_status_running_pid", lambda runtime: 123)
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [123])
+
+    assert gateway_windows._wait_for_gateway_ready(timeout_s=0.01, interval_s=0) == []
+
+
+def test_gateway_ready_waits_for_running_state_and_matching_pid(monkeypatch):
+    from gateway import status as status_mod
+
+    states = iter(("starting", "running"))
+
+    def read_runtime_status():
+        return {"gateway_state": next(states), "pid": 321}
+
+    monkeypatch.setattr(status_mod, "read_runtime_status", read_runtime_status)
+    monkeypatch.setattr(status_mod, "get_running_pid", lambda cleanup_stale=False: 321)
+    monkeypatch.setattr(status_mod, "get_runtime_status_running_pid", lambda runtime: 321)
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [321])
+
+    assert gateway_windows._wait_for_gateway_ready(timeout_s=1, interval_s=0) == [321]
+
+
+def test_gateway_ready_rejects_runtime_pid_mismatch(monkeypatch):
+    from gateway import status as status_mod
+
+    runtime = {"gateway_state": "running", "pid": 456}
+    monkeypatch.setattr(status_mod, "read_runtime_status", lambda: runtime)
+    monkeypatch.setattr(status_mod, "get_running_pid", lambda cleanup_stale=False: 654)
+    monkeypatch.setattr(status_mod, "get_runtime_status_running_pid", lambda payload: 456)
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [456, 654])
+
+    assert gateway_windows._wait_for_gateway_ready(timeout_s=0.01, interval_s=0) == []
+
+
+def test_gateway_ready_exits_early_for_matching_startup_failure(monkeypatch):
+    from gateway import status as status_mod
+
+    runtime = {"gateway_state": "startup_failed", "pid": 789}
+    monotonic_values = iter((0.0, 0.1, 0.2))
+    monkeypatch.setattr(gateway_windows.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(status_mod, "read_runtime_status", lambda: runtime)
+    monkeypatch.setattr(status_mod, "get_running_pid", lambda cleanup_stale=False: 789)
+    monkeypatch.setattr(status_mod, "get_runtime_status_running_pid", lambda payload: None)
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [789])
+
+    assert gateway_windows._wait_for_gateway_ready(timeout_s=120, interval_s=0) == []
+
+
+def test_restart_uses_shared_gateway_ready_timeout(monkeypatch):
+    calls = []
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "stop", lambda: calls.append(("stop", None)))
+    monkeypatch.setattr(gateway_windows, "start", lambda: calls.append(("start", None)))
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_absent", lambda timeout_s: True)
+    monkeypatch.setattr(gateway_windows.time, "sleep", lambda seconds: None)
+
+    def wait_for_ready(*, timeout_s):
+        calls.append(("ready", timeout_s))
+        return [123]
+
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_ready", wait_for_ready)
+
+    gateway_windows.restart()
+
+    assert ("ready", gateway_windows._GATEWAY_READY_TIMEOUT_S) in calls
+
+
+def test_install_scheduled_task_success_start_now_uses_authoritative_task(monkeypatch, tmp_path, capsys):
+    """A successful install must start through its supervised Scheduled Task."""
     script_path = tmp_path / "Hermes_Gateway_alice.cmd"
     calls = []
 
@@ -407,8 +481,11 @@ def test_install_scheduled_task_success_start_now_uses_direct_spawn_not_task_run
 
     gateway_windows.install(force=False)
 
-    assert not any(call[0] == "schtasks" and "/Run" in call[1] for call in calls)
-    assert ("spawn", None) in calls
+    assert (
+        "schtasks",
+        ("/Run", "/TN", "Hermes_Gateway_alice"),
+    ) in calls
+    assert not any(call[0] == "spawn" for call in calls)
     assert any(call[0] == "report_start" for call in calls)
     out = capsys.readouterr().out
     assert "auto-start installed for Windows login" in out
@@ -553,6 +630,31 @@ def test_start_noops_when_gateway_already_running(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "already running" in out
     assert "27128" in out
+
+
+def test_start_registered_task_failure_does_not_spawn_unowned_gateway(monkeypatch):
+    """A registered task remains authoritative even when its /Run fails."""
+    calls = []
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
+    monkeypatch.setattr(gateway_windows, "is_startup_entry_installed", lambda: False)
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway_alice")
+    monkeypatch.setattr(
+        gateway_windows,
+        "_exec_schtasks",
+        lambda args: (1, "", "ERROR: Access is denied."),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_spawn_detached",
+        lambda path=None: calls.append(("spawn", path)) or 12345,
+    )
+
+    with pytest.raises(RuntimeError, match="schtasks /Run failed"):
+        gateway_windows.start()
+
+    assert not calls
 
 
 def test_install_startup_fallback_does_not_spawn_when_gateway_already_running(monkeypatch, tmp_path, capsys):

@@ -55,6 +55,7 @@ _TASK_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
 _TASK_LOGON_DELAY = "PT30S"
 _TASK_RESTART_INTERVAL = "PT1M"
 _TASK_RESTART_COUNT = 999
+_GATEWAY_READY_TIMEOUT_S = 120.0
 
 
 def _schtasks_encoding() -> str:
@@ -433,7 +434,7 @@ def _build_gateway_vbs_script(
     lines = [
         f"' {_TASK_DESCRIPTION}",
         "Option Explicit",
-        "Dim sh, env, existing_pp",
+        "Dim sh, env, existing_pp, exit_code",
         'Set sh = CreateObject("WScript.Shell")',
         'Set env = sh.Environment("PROCESS")',
         f"env.Item({_quote_vbs_string('HERMES_HOME')}) = {_quote_vbs_string(hermes_home)}",
@@ -449,9 +450,12 @@ def _build_gateway_vbs_script(
         f"  env.Item({_quote_vbs_string('PYTHONPATH')}) = {_quote_vbs_string(static_pythonpath)}",
         "End If",
         f"sh.CurrentDirectory = {_quote_vbs_string(working_dir)}",
-        # Window style 0 = hidden; bWaitOnReturn False = detached/async. pythonw is
-        # GUI-subsystem so no console is ever created for the gateway either.
-        f"sh.Run {_quote_vbs_string(command_line)}, 0, False",
+        # Window style 0 = hidden. Waiting keeps wscript.exe resident as the
+        # Scheduled Task supervisor so Task Scheduler can observe the gateway's
+        # exit code and apply IgnoreNew / RestartOnFailure correctly. Both
+        # processes are GUI-subsystem executables, so no console is created.
+        f"exit_code = sh.Run({_quote_vbs_string(command_line)}, 0, True)",
+        "WScript.Quit exit_code",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -702,7 +706,11 @@ def _resolve_detached_python(python_exe: str) -> tuple[str, Path, list[str]]:
         base_pythonw = Path(home) / "pythonw.exe"
         site_packages = venv_dir / "Lib" / "site-packages"
         if base_pythonw.exists() and site_packages.exists():
-            return (str(base_pythonw), venv_dir, [str(site_packages)])
+            return (
+                str(base_pythonw),
+                venv_dir,
+                [str(site_packages), *_pywin32_pythonpath_entries(site_packages)],
+            )
 
     return (windowed, venv_dir, [])
 
@@ -715,6 +723,25 @@ def _prepend_pythonpath(env_overlay: dict[str, str], entries: list[str]) -> None
     if existing:
         clean_entries.append(existing)
     env_overlay["PYTHONPATH"] = os.pathsep.join(clean_entries)
+
+
+def _prepend_path(env_overlay: dict[str, str], entries: list[str]) -> None:
+    clean_entries = [entry for entry in entries if entry]
+    if not clean_entries:
+        return
+    existing = os.environ.get("PATH", "")
+    if existing:
+        clean_entries.append(existing)
+    env_overlay["PATH"] = os.pathsep.join(clean_entries)
+
+
+def _pywin32_pythonpath_entries(site_packages: Path) -> list[str]:
+    entries: list[str] = []
+    for relative in ("win32", "win32/lib", "pythonwin"):
+        candidate = site_packages / relative
+        if candidate.exists():
+            entries.append(str(candidate))
+    return entries
 
 
 def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
@@ -750,6 +777,9 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
         "VIRTUAL_ENV": str(venv_dir),
     }
     _prepend_pythonpath(env_overlay, [project_root, *extra_pythonpath] if extra_pythonpath else [project_root])
+    pywin32_system32 = venv_dir / "Lib" / "site-packages" / "pywin32_system32"
+    if pywin32_system32.exists():
+        _prepend_path(env_overlay, [str(pywin32_system32)])
     return argv, working_dir, env_overlay
 
 
@@ -960,8 +990,7 @@ def install(
             if running_pids:
                 print(f"✓ Gateway already running (PID: {', '.join(map(str, running_pids))})")
             else:
-                pid = _spawn_detached()
-                _report_gateway_start(f"direct spawn (PID {pid})")
+                _start_registered_task()
         else:
             print("ℹ Gateway not started now.")
             print("  Start manually with: hermes gateway start")
@@ -991,48 +1020,55 @@ def install(
 
     # schtasks create didn't work. See if it's a "fall back to startup" case.
     if _should_fall_back(1, detail):
-        print(f"↻ Scheduled Task install blocked ({detail.splitlines()[0]}) — using Startup folder fallback")
-        entry = _install_startup_entry(script_path)
-        print(f"✓ Installed Windows login item: {entry}")
-        print(f"  Task script: {script_path}")
-
-        # Re-running `hermes -p <profile> gateway install` must be safe.
-        # Startup-folder fallback only installs login persistence. Starting is
-        # controlled by the pre-UAC start_now answer so all user decisions happen
-        # before any elevation prompt.
-        from hermes_cli.gateway import find_gateway_pids, _profile_arg
-
-        running_pids = list(find_gateway_pids())
-        if running_pids:
-            print(f"✓ Gateway already running (PID: {', '.join(map(str, running_pids))})")
-        elif start_now:
-            pid = _spawn_detached()
-            _report_gateway_start(f"direct spawn (PID {pid})")
-        else:
-            profile_arg = _profile_arg()
-            start_cmd = f"hermes {profile_arg} gateway start" if profile_arg else "hermes gateway start"
-            print("ℹ Startup fallback installed; gateway not started now.")
-            print(f"  Start manually with: {start_cmd}")
-        _print_next_steps()
+        _install_startup_fallback(script_path, start_now, detail)
         return
 
     # Unknown schtasks error — surface it and bail.
     raise RuntimeError(f"Windows gateway install failed: {detail}")
 
 
-def _wait_for_gateway_ready(timeout_s: float = 6.0, interval_s: float = 0.4) -> list[int]:
-    """Poll for a live gateway process for up to ``timeout_s`` seconds.
+def _wait_for_gateway_ready(
+    timeout_s: float = _GATEWAY_READY_TIMEOUT_S,
+    interval_s: float = 0.4,
+) -> list[int]:
+    """Poll until the authoritative runtime record reports a running gateway.
 
-    Returns the list of PIDs found. Empty list means nothing came up in
-    time — the caller should surface that to the user as a failed start.
+    A gateway-shaped process can exist for a long time while plugins, MCP
+    servers, and platforms are still starting. Readiness therefore requires the
+    persisted runtime state, runtime PID validation, and PID/lock authority to
+    agree on the same live process.
     """
+    from gateway.status import (
+        get_running_pid,
+        get_runtime_status_running_pid,
+        read_runtime_status,
+    )
     from hermes_cli.gateway import find_gateway_pids
 
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        pids = list(find_gateway_pids())
-        if pids:
-            return pids
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    while time.monotonic() < deadline:
+        runtime = read_runtime_status()
+        running_pid = get_running_pid(cleanup_stale=False)
+        if isinstance(runtime, dict):
+            runtime_state = runtime.get("gateway_state")
+            runtime_pid = get_runtime_status_running_pid(runtime)
+            if (
+                runtime_state == "running"
+                and runtime_pid is not None
+                and runtime_pid == running_pid
+            ):
+                return [runtime_pid]
+
+            if runtime_state == "startup_failed":
+                try:
+                    failed_pid = int(runtime.get("pid"))
+                except (TypeError, ValueError):
+                    failed_pid = None
+                if failed_pid is not None and (
+                    failed_pid == running_pid or failed_pid in find_gateway_pids()
+                ):
+                    return []
+
         time.sleep(interval_s)
     return []
 
@@ -1042,11 +1078,26 @@ def _report_gateway_start(via: str) -> None:
     if pids:
         print(f"✓ Gateway started via {via} (PID: {', '.join(map(str, pids))})")
     else:
-        print(f"⚠ Launched gateway via {via}, but no process detected after 6s.")
+        print(
+            f"⚠ Launched gateway via {via}, but it did not reach "
+            f"gateway_state=running within {_GATEWAY_READY_TIMEOUT_S:g}s."
+        )
         print("  Check the log for startup errors:")
         from hermes_cli.config import get_hermes_home
         print(f"    type {Path(get_hermes_home()).resolve()}\\logs\\gateway.log")
         print(f"    type {Path(get_hermes_home()).resolve()}\\logs\\gateway-stdio.log")
+
+
+def _start_registered_task() -> None:
+    """Start the authoritative Scheduled Task or surface the task failure."""
+    task_name = get_task_name()
+    code, _out, err = _exec_schtasks(["/Run", "/TN", task_name])
+    if code != 0:
+        detail = err.strip() or "no error detail"
+        raise RuntimeError(
+            f"schtasks /Run failed for {task_name!r} (code {code}): {detail}"
+        )
+    _report_gateway_start(f"Scheduled Task {task_name!r}")
 
 
 def _print_next_steps() -> None:
@@ -1350,13 +1401,11 @@ def start() -> None:
             return
 
     if task_installed:
-        code, _out, err = _exec_schtasks(["/Run", "/TN", get_task_name()])
-        if code == 0:
-            _report_gateway_start(f"Scheduled Task {get_task_name()!r}")
-            return
-        print(f"⚠ schtasks /Run failed (code {code}): {err.strip()} — falling back to direct spawn")
+        _start_registered_task()
+        return
 
-    # Startup fallback or failed /Run: direct spawn one foreground-detached gateway.
+    # Startup-folder fallback has no Scheduled Task owner, so direct spawn is
+    # the only available start mechanism.
     pid = _spawn_detached()
     _report_gateway_start(f"direct spawn (PID {pid})")
 
@@ -1496,8 +1545,8 @@ def restart() -> None:
     time.sleep(1.0)
     start()
 
-    if not _wait_for_gateway_ready(timeout_s=15.0):
+    if not _wait_for_gateway_ready(timeout_s=_GATEWAY_READY_TIMEOUT_S):
         raise RuntimeError(
-            "Gateway restart did not produce a running gateway process. "
+            "Gateway restart did not reach gateway_state=running. "
             "Check logs/gateway.log and run `hermes gateway status`."
         )
